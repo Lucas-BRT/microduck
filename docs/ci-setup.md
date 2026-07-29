@@ -5,53 +5,63 @@ Status: draft · Date: 2026-07-28 · Owner: pierre
 One-time setup for the release pipeline. See [`updater-design.md`](updater-design.md)
 §5.4 for key custody and §16.3 for the staging → stable model.
 
-## ⚠ Blocked: the approval gate this decision depended on is not available
+## Decision: two keys, two triggers, and no gate on this plan
 
-**Status: unresolved. `release-1` is deliberately NOT in CI, and no release can be cut
-until this is decided.**
+**Decided 2026-07-29.** Branch pushes are signed with `team.dev`; tagged releases and
+promotions are signed with `release-1`. Both keys live in CI.
 
-The plan was: CI signs, and reaching the key needs a second person's approval via the
-`release` environment's required-reviewers rule. Attempting to create that rule fails:
+| trigger | workflow | key | reaches a customer robot |
+|---|---|---|---|
+| push to any branch | `dev.yml` | `team.dev` (repo secret) | **no** — `allow_dev_keys = false` there, and the trusted filename must end `.dev.pub` |
+| tag `daemon-staging-v*` | `release.yml` | `release-1` (`release` env secret) | not until promoted — published as a prerelease |
+| manual promotion | `promote.yml` | `release-1` | **yes** |
+
+This split is clean in a way an earlier proposal was not: keys never cross *within* the
+staging → stable path, so promotion still re-signs a manifest over identical bytes (§16.3).
+An artifact signed by `team.dev` could not be promoted, because `promote` points `sig_url`
+at the staging artifact's existing signature — which is why dev builds stay dev builds
+rather than becoming release candidates.
+
+### What was intended, and why it is not there
+
+The plan was to gate `release-1` behind the `release` environment's required-reviewers rule.
+It cannot be created:
 
 ```
 HTTP 422: Failed to create the environment protection rule.
 Please ensure the billing plan supports the required reviewers protection rule.
 ```
 
-Environment **protection rules** — required reviewers, wait timers, deployment branch
-policies — need GitHub Team or Enterprise on a *private* repository. `pollen-robotics` is
-on the free plan. The `release` environment exists, with zero protection rules.
+Tag protection was checked as a substitute and is also unavailable:
 
-Environment-scoping the secrets does not substitute for it. A secret scoped to an
-environment is only readable by a job that declares `environment: release` — but with no
-deployment branch policy, *any* branch may deploy to that environment, so any collaborator
-who can push can add a workflow that declares it and prints the key. Scoping prevents
-accidental exposure by an unrelated workflow; it does not prevent a person.
+```
+403: Upgrade to GitHub Pro or make this repository public to enable this feature.
+```
 
-That matters more now than it would have last week: the point of the tiering below was to
-bound what a CI compromise costs, and "a teammate can extract the fleet signing key with a
-three-line workflow" is a larger blast radius than the design accepted. So the original
-trade — friction versus a networked key — has to be made again, with the gate off the table:
+Required reviewers, deployment branch policies, branch protection and rulesets are all
+Team/Pro features on a *private* repository, and `pollen-robotics` is on the free plan. The
+`release` environment exists with zero protection rules.
 
-| option | cost | leaves the fleet key off CI |
-|---|---|---|
-| **Sign locally, don't wire CI signing** | a few minutes per release, by hand | yes |
-| Split: CI signs staging with `team.dev`, a human signs promotion with `release-1` | needs `promote` to re-sign the **artifact**, not only the manifest (see below) | yes |
-| Upgrade the org to GitHub Team | money, org-level decision | no, but the gate works as designed |
-| Put `release-1` in CI ungated | none | **no** — any collaborator can take it |
+### The accepted risk, stated plainly
 
-Signing locally is the cheapest correct answer *right now*: zero releases have been cut, the
-cadence is a release every 2–3 weeks and later every 2–3 months (§3), and `xtask sign` is
-already the same code path CI would run. It stops being cheap when releases get frequent or
-when someone other than the key holder needs to cut one.
+**Anyone with push access can read `release-1`.** Scoping it to the `release` environment
+stops a workflow that does not declare that environment from seeing it, but any collaborator
+can author one that does. "Used only for releases" is therefore a convention among people who
+already trust each other, not an access control — the workflow file is not a boundary.
 
-**The split option needs a code change first.** `xtask promote` re-signs the *manifest* and
-points `sig_url` at the staging artifact's existing `.minisig`, so the artifact signature is
-whatever staging used. If staging were signed with `team.dev`, a customer robot
-(`allow_dev_keys = false`) would refuse the artifact even after promotion. Promotion would
-have to re-sign the artifact bytes with `release-1` and upload that signature alongside the
-stable manifest — which preserves the "identical bytes" property (§16.3), since only the
-signature file changes.
+This was accepted deliberately: the team is small and mutually trusted, no robot has left the
+building, and the alternative (signing every release by hand) buys nothing today against a
+threat that does not yet exist.
+
+**Revisit when either becomes true**, because the cost changes sharply and the failure is the
+one this design cannot undo — a leaked key means shipping a `release-2`-signed update to every
+robot, and any robot that misses it trusts the compromised key forever:
+
+- a robot is in someone's home, or
+- someone with push access is not someone you would hand the signing key to directly.
+
+The fix at that point is upgrading the org to GitHub Team, which keeps this split and adds the
+gate; or moving `release-1` signing back to a laptop.
 
 ## The tiering (unchanged, and still the thing that bounds damage)
 
@@ -91,12 +101,19 @@ gh secret set MINISIGN_PASSWORD --env release
 
 The second prompts, so the passphrase never lands in shell history or a transcript.
 
-**Secrets** (encrypted, not readable back):
+**Secrets** (encrypted, not readable back). Current state:
 
-| name | value |
-|---|---|
-| `MINISIGN_SECRET_KEY` | full contents of `~/.duck-keys/release-1.key`, both lines |
-| `MINISIGN_PASSWORD` | the passphrase for `release-1` |
+| name | scope | value | set |
+|---|---|---|---|
+| `MINISIGN_SECRET_KEY` | `release` env | `~/.duck-keys/release-1.key`, both lines | ✅ |
+| `MINISIGN_PASSWORD` | `release` env | the passphrase for `release-1` | ✅ |
+| `MINISIGN_DEV_SECRET_KEY` | **repo** | `~/.duck-keys/team.dev.key` | ✅ |
+
+`MINISIGN_DEV_SECRET_KEY` is repo-scoped on purpose: every branch push signs with it, so
+gating it behind an environment would mean the dev workflow declaring one meant for
+`release-1`. It needs no passphrase secret — a dev key is unencrypted so CI can sign
+non-interactively, which `xtask keycheck` confirms and calls correct for a dev key and wrong
+for a release key.
 
 **Variables** (plain, readable — a public key is not a secret):
 
