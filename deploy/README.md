@@ -51,6 +51,24 @@ at boot for the boot counter to recover through.
 which is the offline and factory path, and what CI uses to verify a release before
 publishing it.
 
+### ⚠ While the repository is private, a robot needs a token
+
+A private repo's release assets are unreachable without credentials — the
+`releases/download/...` URL 404s even with one, so the engine resolves assets through the
+release API instead. `updaterd` reads `GITHUB_TOKEN` from its environment, which on a board
+means a systemd drop-in, not a shell export.
+
+That is fine on a developer's board (see the README) and **not** fine on a customer robot: a
+fleet-wide credential in an image is one that leaks and cannot be rotated without reflashing,
+which is the failure the tiered signing keys exist to avoid. So `scripts/install.sh` does not
+provision a token, and a robot installed today can be provisioned but cannot fetch an update
+unless someone adds one by hand.
+
+Artifact hosting is therefore an open decision, not a settled one —
+[`../docs/updater-design.md`](../docs/updater-design.md) §6.1 has the options. The cheap one
+is a second, public repository holding only signed artifacts: signatures are what make an
+artifact safe to serve, not obscurity, and the source stays private.
+
 ### The trust chain
 
 1. TLS to `raw.githubusercontent.com` for this script, `updater.toml` and the public keys.

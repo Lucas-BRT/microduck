@@ -20,7 +20,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-229 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+246 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
@@ -156,9 +156,36 @@ sudo cp team.dev.pub /etc/robot/trusted_keys/
 sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
 ```
 
+While this repository is **private**, the board also needs a GitHub token — a private repo's
+release assets are unreachable without one, and `updaterd` reads `GITHUB_TOKEN` from its
+environment, so exporting it in your shell does not reach the daemon. Use a drop-in with a
+fine-grained, read-only token:
+
 ```bash
-sudo systemctl restart updaterd
+sudo mkdir -p /etc/systemd/system/updaterd.service.d
 ```
+
+Substitute your own token in the next block — it is the only placeholder here:
+
+```bash
+sudo tee /etc/systemd/system/updaterd.service.d/token.conf > /dev/null <<'EOF'
+[Service]
+Environment=GITHUB_TOKEN=ghp_replace_with_your_token
+EOF
+```
+
+```bash
+sudo chmod 600 /etc/systemd/system/updaterd.service.d/token.conf
+```
+
+`chmod 600` because a drop-in is world-readable by default, and this one holds a credential.
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart updaterd
+```
+
+A token on a *developer's* board is fine. A token on a customer robot is not, and is why
+artifact hosting is still an open question — see `docs/updater-design.md` §6.1.
 
 ## Releasing
 
@@ -192,7 +219,13 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 
 - **Works and is tested:** the update engine end to end — verification, atomic swap, health
   gate, auto-rollback, boot-counter recovery, first-install bootstrap, release packaging and
-  signing.
+  signing. Releases are cut and signed in CI; a real one has been published and installed
+  through the engine.
+- **The dev channel works.** Every branch push publishes a signed build installable with
+  `--ref`, verified against the real repository, and refused by a customer-robot config.
+- **Open:** artifact hosting. This repo is private, and a robot without a token cannot
+  download from it (§6.1). Dev boards have tokens; the fleet will need a public
+  artifact-only repository or an object store. Blocks hardware bring-up, not development.
 - **Skeleton:** `robotd`.
 - **Not started:** `mediad`, `btd`, the phone app, the SDK, safety authority.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
