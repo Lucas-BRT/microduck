@@ -727,10 +727,10 @@ impl Server {
                 // Prefer draining progress so the client sees ordered phases.
                 biased;
                 Some(progress) = local_rx.recv(), if !client_gone => {
-                    if let Ok(note) = Request::notification(method::PROGRESS, &progress)
-                        && write_line(out, &note).await.is_err() {
-                            client_gone = true;
-                        }
+                    let note = Request::notify_progress(&progress);
+                    if write_line(out, &note).await.is_err() {
+                        client_gone = true;
+                    }
                 }
                 outcome = &mut operation => break outcome,
             }
@@ -739,13 +739,11 @@ impl Server {
         pump.abort();
         // Anything the pump already queued is still worth sending.
         while let Ok(progress) = local_rx.try_recv() {
-            if let Ok(note) = Request::notification(method::PROGRESS, &progress) {
-                let _ = write_line(out, &note).await;
-            }
+            let _ = write_line(out, &Request::notify_progress(&progress)).await;
         }
 
         match result {
-            Ok(outcome) => ok_response(&id, &outcome),
+            Ok(outcome) => Response::ok(Some(id), &outcome),
             Err(e) => Response::err(Some(id), e.to_rpc_error()),
         }
     }
@@ -759,18 +757,12 @@ impl Server {
         let mut rx = self.progress_tx.subscribe();
 
         for progress in self.latest.lock().await.iter() {
-            if let Ok(note) = Request::notification(method::PROGRESS, progress) {
-                write_line(out, &note).await?;
-            }
+            write_line(out, &Request::notify_progress(progress)).await?;
         }
 
         loop {
             match rx.recv().await {
-                Ok(progress) => {
-                    if let Ok(note) = Request::notification(method::PROGRESS, &progress) {
-                        write_line(out, &note).await?;
-                    }
-                }
+                Ok(progress) => write_line(out, &Request::notify_progress(&progress)).await?,
                 // A slow subscriber gets a gap, never backpressure onto the update.
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::debug!(skipped, "subscriber lagged");
@@ -791,10 +783,11 @@ impl Server {
     async fn authorise(
         &self,
         id: &Id,
-        method: &str,
+        call: &Call,
         peer: Option<tokio::net::unix::UCred>,
-        component: Option<&str>,
     ) -> Result<(), Response> {
+        let method = call.method();
+        let component = call.component().map(proto::ComponentId::as_str);
         let verdict = {
             let policy = self.policy.lock().await;
             match policy.as_ref() {
@@ -845,21 +838,4 @@ async fn write_line<T: serde::Serialize>(
     line.push(b'\n');
     out.write_all(&line).await?;
     out.flush().await
-}
-
-/// Build a success response, turning a serialisation failure into an RPC error
-/// rather than panicking.
-fn ok_response<T: serde::Serialize>(id: &Id, value: &T) -> Response {
-    match serde_json::to_value(value) {
-        Ok(value) => Response {
-            jsonrpc: proto::JSONRPC_VERSION.to_owned(),
-            id: Some(id.clone()),
-            result: Some(value),
-            error: None,
-        },
-        Err(e) => Response::err(
-            Some(id.clone()),
-            proto::Error::new(proto::code::INTERNAL_ERROR, e.to_string()),
-        ),
-    }
 }

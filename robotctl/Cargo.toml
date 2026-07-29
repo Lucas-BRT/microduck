@@ -9,7 +9,7 @@ description = "Local CLI for the robot — currently the `update` namespace only
 # it will front `robotd` and other services too. Today it only implements
 # `robotctl update …`.
 #
-# Depends on `robot-proto` alone, not on `updater`. That was the point of extracting the
+# Depends on `duck-ipc-proto` alone, not on `updater`. That was the point of extracting the
 # protocol: a support tool on the recovery path should not link the update engine's
 # http/tar/zstd/crypto tree, and structurally cannot now reach into engine internals
 # instead of going through the socket.

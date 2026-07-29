@@ -93,17 +93,12 @@ impl SocketRobotClient {
     /// `None`, which callers map to their `Unreachable` variant. A wedged peer
     /// (socket open, silent) must be indistinguishable from a dead one, or the
     /// engine would hang on exactly the robot it is trying to repair.
-    async fn ask(&self, method: &str, timeout: Duration) -> Option<serde_json::Value> {
+    async fn ask(&self, call: &crate::proto::Call, timeout: Duration) -> Option<serde_json::Value> {
         let exchange = async {
             let stream = tokio::net::UnixStream::connect(&self.path).await.ok()?;
             let (read_half, mut write_half) = stream.into_split();
 
-            let request = crate::proto::Request::new(
-                crate::proto::Id::Number(1),
-                method,
-                serde_json::json!({}),
-            )
-            .ok()?;
+            let request = crate::proto::Request::call(crate::proto::Id::Number(1), call);
             let mut line = serde_json::to_vec(&request).ok()?;
             line.push(b'\n');
 
@@ -124,31 +119,25 @@ impl SocketRobotClient {
         match tokio::time::timeout(timeout, exchange).await {
             Ok(result) => result,
             Err(_elapsed) => {
-                tracing::debug!(method, "robotd did not answer within the timeout");
+                tracing::debug!(
+                    method = call.method(),
+                    "robotd did not answer within the timeout"
+                );
                 None
             }
         }
     }
 }
 
-/// Method names, from the shared contract rather than duplicated here — a second copy
-/// of a wire constant is a second place for it to drift.
-mod robotd_method {
-    pub use crate::proto::method::{
-        ROBOT_HEALTH as HEALTH, ROBOT_MODEL_API as MODEL_API,
-        ROBOT_SAFE_TO_RESTART as SAFE_TO_RESTART, ROBOT_SESSION_ACTIVE as SESSION_ACTIVE,
-    };
-}
-
 #[async_trait::async_trait]
 impl RobotClient for SocketRobotClient {
     async fn safe_to_restart(&self, timeout: Duration) -> SafeToRestart {
-        let Some(result) = self.ask(robotd_method::SAFE_TO_RESTART, timeout).await else {
+        let call = crate::proto::Call::RobotSafeToRestart;
+        let Some(result) = self.ask(&call, timeout).await else {
             return SafeToRestart::Unreachable;
         };
-        // Typed, so the two sides cannot drift. An answer we cannot parse is treated as
-        // unreachable rather than guessed at: guessing "safe" could restart a walking
-        // robot.
+        // An answer we cannot parse is treated as unreachable rather than guessed at:
+        // guessing "safe" could restart a walking robot.
         match serde_json::from_value::<crate::proto::SafeToRestartResult>(result) {
             Ok(answer) if answer.safe => SafeToRestart::Yes,
             Ok(answer) => SafeToRestart::No(
@@ -164,7 +153,7 @@ impl RobotClient for SocketRobotClient {
     }
 
     async fn health(&self, timeout: Duration) -> Health {
-        let Some(result) = self.ask(robotd_method::HEALTH, timeout).await else {
+        let Some(result) = self.ask(&crate::proto::Call::RobotHealth, timeout).await else {
             return Health::Unreachable;
         };
         match serde_json::from_value::<crate::proto::HealthResult>(result) {
@@ -182,7 +171,9 @@ impl RobotClient for SocketRobotClient {
     }
 
     async fn model_api(&self, timeout: Duration) -> Option<u32> {
-        let result = self.ask(robotd_method::MODEL_API, timeout).await?;
+        let result = self
+            .ask(&crate::proto::Call::RobotModelApi, timeout)
+            .await?;
         serde_json::from_value::<crate::proto::ModelApiResult>(result)
             .ok()
             .map(|answer| answer.model_api)
@@ -191,7 +182,7 @@ impl RobotClient for SocketRobotClient {
     async fn remote_session_active(&self, timeout: Duration) -> bool {
         // Defaults to false when unknown: this check is a courtesy and must never be
         // the reason a recovery update is refused.
-        self.ask(robotd_method::SESSION_ACTIVE, timeout)
+        self.ask(&crate::proto::Call::RobotRemoteSessionActive, timeout)
             .await
             .and_then(|r| serde_json::from_value::<crate::proto::SessionActiveResult>(r).ok())
             .is_some_and(|answer| answer.active)

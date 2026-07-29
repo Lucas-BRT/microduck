@@ -335,10 +335,20 @@ impl Client {
         }
     }
 
+    /// Send a raw method name and params.
+    ///
+    /// Built by hand rather than through [`proto::Request::call`] on purpose: several tests
+    /// below send shapes a typed client cannot express — a malformed `params`, an
+    /// unsupported api_version — which is exactly what the server's error paths exist for.
     async fn send(&mut self, method: &str, params: serde_json::Value) -> proto::Id {
         let id = proto::Id::Number(self.next_id);
         self.next_id += 1;
-        let request = proto::Request::new(id.clone(), method, params).unwrap();
+        let request = proto::Request {
+            jsonrpc: proto::JSONRPC_VERSION.to_owned(),
+            id: Some(id.clone()),
+            method: method.to_owned(),
+            params: Some(params),
+        };
         let mut line = serde_json::to_vec(&request).unwrap();
         line.push(b'\n');
         self.writer.write_all(&line).await.unwrap();
@@ -358,7 +368,7 @@ impl Client {
             if let Ok(note) = serde_json::from_str::<proto::Request>(trimmed)
                 && note.is_notification()
             {
-                if let Ok(progress) = note.params_as::<proto::Progress>() {
+                if let Ok(progress) = note.as_progress() {
                     phases.push(progress.phase);
                 }
                 continue;

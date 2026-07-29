@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use robot_proto as proto;
+use duck_ipc_proto as proto;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -215,29 +215,27 @@ impl Client {
         })
     }
 
-    /// Send a request and return its terminal response.
-    ///
-    /// Progress notifications arrive interleaved and carry no `id`; they go to stderr
-    /// so stdout stays pipeable. Anything with a non-matching id is ignored rather
-    /// than treated as an error.
-    fn call(
-        &mut self,
-        method: &str,
-        params: impl serde::Serialize,
-    ) -> Result<proto::Response, Failure> {
-        let id = proto::Id::Number(self.next_id);
-        self.next_id += 1;
-
-        let request = proto::Request::new(id.clone(), method, params)
-            .map_err(|e| Failure::new(exit::FAILED, format!("could not encode request: {e}")))?;
-
-        let mut line = serde_json::to_vec(&request)
+    /// Write one request. Used by [`Self::call`] and by `watch`, which reads replies
+    /// itself rather than waiting for a terminal response.
+    fn send(&mut self, request: &proto::Request) -> Result<(), Failure> {
+        let mut line = serde_json::to_vec(request)
             .map_err(|e| Failure::new(exit::FAILED, format!("could not encode request: {e}")))?;
         line.push(b'\n');
         self.writer
             .write_all(&line)
             .and_then(|()| self.writer.flush())
-            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("could not send request: {e}")))?;
+            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("could not send request: {e}")))
+    }
+
+    /// Send a call and return its terminal response.
+    ///
+    /// Progress notifications arrive interleaved and carry no `id`; they go to stderr
+    /// so stdout stays pipeable. Anything with a non-matching id is ignored rather
+    /// than treated as an error.
+    fn call(&mut self, call: &proto::Call) -> Result<proto::Response, Failure> {
+        let id = proto::Id::Number(self.next_id);
+        self.next_id += 1;
+        self.send(&proto::Request::call(id.clone(), call))?;
 
         loop {
             let mut buf = String::new();
@@ -260,7 +258,7 @@ impl Client {
             if let Ok(note) = serde_json::from_str::<proto::Request>(trimmed)
                 && note.is_notification()
             {
-                if let Ok(progress) = note.params_as::<proto::Progress>() {
+                if let Ok(progress) = note.as_progress() {
                     report_progress(&progress);
                 }
                 continue;
@@ -289,12 +287,9 @@ impl Client {
     /// most useful thing the command can report, so refusing to print it would defeat the
     /// purpose. The protocol check still fails for every *other* command.
     fn hello_result(&mut self) -> Result<proto::HelloResult, Failure> {
-        let response = self.call(
-            proto::method::HELLO,
-            proto::HelloParams {
-                api_version: proto::API_VERSION,
-            },
-        )?;
+        let response = self.call(&proto::Call::Hello(proto::HelloParams {
+            api_version: proto::API_VERSION,
+        }))?;
         if let Some(error) = response.error {
             return Err(Failure::new(
                 exit::FAILED,
@@ -446,36 +441,31 @@ fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Fai
 /// once branch installs land, several builds share a version — so it is worth the extra
 /// round trip in a diagnostic command.
 fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
-    let Ok(status) = client.call(proto::method::STATUS, serde_json::json!({})) else {
+    let Ok(response) = client.call(&proto::Call::Status) else {
         return Vec::new();
     };
-    let Some(entries) = status.result.as_ref().and_then(|r| r.as_array()) else {
+    let Ok(statuses) = response.result_as::<Vec<proto::ComponentStatus>>() else {
         return Vec::new();
     };
 
-    entries
-        .iter()
-        .map(|entry| {
-            let name = entry["component"].as_str().unwrap_or("?").to_owned();
-            let installed = entry["installed"].as_str().map(str::to_owned);
+    statuses
+        .into_iter()
+        .map(|status| {
             let revision = client
-                .call(
-                    proto::method::LIST_INSTALLED,
-                    serde_json::json!({ "component": name }),
-                )
+                .call(&proto::Call::ListInstalled(proto::ComponentParams {
+                    component: status.component.clone(),
+                }))
                 .ok()
-                .and_then(|r| r.result)
-                .and_then(|list| {
-                    list.as_array()?
-                        .iter()
-                        .find(|r| r["active"].as_bool() == Some(true))?
-                        .get("source_revision")?
-                        .as_str()
-                        .map(str::to_owned)
+                .and_then(|r| r.result_as::<Vec<proto::InstalledRelease>>().ok())
+                .and_then(|releases| {
+                    releases
+                        .into_iter()
+                        .find(|release| release.active)?
+                        .source_revision
                 });
             ComponentReport {
-                name,
-                installed,
+                name: status.component.to_string(),
+                installed: status.installed.map(|v| v.to_string()),
                 revision,
             }
         })
@@ -681,53 +671,54 @@ fn run(cli: Cli) -> Result<(), Failure> {
     let mut client = Client::connect(&cli.socket)?;
     client.hello()?;
 
-    let (method, params): (&str, serde_json::Value) = match &command {
-        UpdateCommand::Check { component } => (
-            proto::method::CHECK,
-            serde_json::json!({ "component": component.clone().unwrap_or_else(|| "daemon".into()) }),
-        ),
+    let component = |name: &str| proto::ComponentParams {
+        component: proto::ComponentId::new(name),
+    };
+    let call = match &command {
+        UpdateCommand::Check { component: name } => {
+            proto::Call::Check(component(name.as_deref().unwrap_or("daemon")))
+        }
         UpdateCommand::Apply {
-            component,
+            component: name,
             version,
             dry_run,
             interrupt_sessions,
-        } => (
-            proto::method::APPLY,
-            serde_json::json!({
-                "component": component,
-                "target": match version {
-                    Some(v) => serde_json::json!({ "exact": v }),
-                    None => serde_json::json!("latest"),
-                },
-                "options": { "dry_run": dry_run, "interrupt_sessions": interrupt_sessions },
-            }),
-        ),
-        UpdateCommand::Rollback { component } => (
-            proto::method::ROLLBACK,
-            serde_json::json!({ "component": component }),
-        ),
-        UpdateCommand::ResetToGolden { component } => (
-            proto::method::RESET_TO_GOLDEN,
-            serde_json::json!({ "component": component }),
-        ),
-        UpdateCommand::Select { component, version } => (
-            proto::method::SELECT,
-            serde_json::json!({ "component": component, "version": version }),
-        ),
-        UpdateCommand::Pin { component, version } => (
-            proto::method::PIN,
-            serde_json::json!({ "component": component, "version": version }),
-        ),
-        UpdateCommand::Status(_) => (proto::method::STATUS, serde_json::json!({})),
-        UpdateCommand::Log { limit } => (proto::method::LOG, serde_json::json!({ "limit": limit })),
-        UpdateCommand::Watch => (proto::method::SUBSCRIBE, serde_json::json!({})),
+        } => proto::Call::Apply(proto::ApplyParams {
+            component: proto::ComponentId::new(name),
+            target: match version {
+                Some(version) => proto::Target::Exact(version.clone()),
+                None => proto::Target::Latest,
+            },
+            options: proto::ApplyOptions {
+                dry_run: *dry_run,
+                interrupt_sessions: *interrupt_sessions,
+            },
+        }),
+        UpdateCommand::Rollback { component: name } => proto::Call::Rollback(component(name)),
+        UpdateCommand::ResetToGolden { component: name } => {
+            proto::Call::ResetToGolden(component(name))
+        }
+        UpdateCommand::Select {
+            component: name,
+            version,
+        } => proto::Call::Select(proto::SelectParams {
+            component: proto::ComponentId::new(name),
+            version: version.clone(),
+        }),
+        UpdateCommand::Pin {
+            component: name,
+            version,
+        } => proto::Call::Pin(proto::PinParams {
+            component: proto::ComponentId::new(name),
+            version: version.clone(),
+        }),
+        UpdateCommand::Status(_) => proto::Call::Status,
+        UpdateCommand::Log { limit } => proto::Call::Log(proto::LogParams { limit: *limit }),
+        // Streams until interrupted, so it never reaches the single-response path below.
+        UpdateCommand::Watch => return watch(&mut client),
     };
 
-    if matches!(command, UpdateCommand::Watch) {
-        return watch(&mut client, method);
-    }
-
-    let response = client.call(method, params)?;
+    let response = client.call(&call)?;
     if let Some(error) = response.error {
         return Err(Failure::from_rpc(error));
     }
@@ -736,17 +727,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
 }
 
 /// `watch` never returns normally: it streams until interrupted.
-fn watch(client: &mut Client, method: &str) -> Result<(), Failure> {
-    let request = proto::Request::new(proto::Id::Number(999), method, serde_json::json!({}))
-        .map_err(|e| Failure::new(exit::FAILED, e.to_string()))?;
-    let mut line =
-        serde_json::to_vec(&request).map_err(|e| Failure::new(exit::FAILED, e.to_string()))?;
-    line.push(b'\n');
-    client
-        .writer
-        .write_all(&line)
-        .and_then(|()| client.writer.flush())
-        .map_err(|e| Failure::new(exit::UNREACHABLE, e.to_string()))?;
+fn watch(client: &mut Client) -> Result<(), Failure> {
+    let request = proto::Request::call(proto::Id::Number(999), &proto::Call::Subscribe);
+    client.send(&request)?;
 
     loop {
         let mut buf = String::new();
@@ -754,7 +737,7 @@ fn watch(client: &mut Client, method: &str) -> Result<(), Failure> {
             return Ok(());
         }
         if let Ok(note) = serde_json::from_str::<proto::Request>(buf.trim())
-            && let Ok(progress) = note.params_as::<proto::Progress>()
+            && let Ok(progress) = note.as_progress()
         {
             println!(
                 "{} {:?} {:?}",
@@ -776,34 +759,49 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
 
     match command {
         UpdateCommand::Status(args) if args.json => json(&result),
+        // Typed, so a renamed field is a compile error rather than a column of "?".
+        // Anything that will not parse falls back to raw JSON: a diagnostic command must
+        // print what it got rather than nothing.
         UpdateCommand::Status(_) => {
-            for entry in result.as_array().unwrap_or(&Vec::new()) {
-                let name = entry["component"].as_str().unwrap_or("?");
-                let installed = entry["installed"].as_str().unwrap_or("none");
-                let healthy = match entry["healthy"].as_bool() {
-                    Some(true) => "healthy",
-                    Some(false) => "UNHEALTHY",
-                    None => "no probe",
-                };
-                println!("{name}: {installed} ({healthy})");
-                if let Some(pinned) = entry["pinned"].as_str() {
-                    println!("  pinned to {pinned}");
-                }
-                if let Some(last) = entry.get("last_attempt").filter(|v| !v.is_null()) {
-                    println!("  last attempt: {}", compact(last));
+            match serde_json::from_value::<Vec<proto::ComponentStatus>>(result.clone()) {
+                Err(_) => json(&result),
+                Ok(statuses) => {
+                    for status in statuses {
+                        let installed = match &status.installed {
+                            Some(version) => version.to_string(),
+                            None => "none".to_owned(),
+                        };
+                        let healthy = match status.healthy {
+                            Some(true) => "healthy",
+                            Some(false) => "UNHEALTHY",
+                            None => "no probe",
+                        };
+                        println!("{}: {installed} ({healthy})", status.component);
+                        if let Some(pinned) = &status.pinned {
+                            println!("  pinned to {pinned}");
+                        }
+                        if let Some(last) = &status.last_attempt {
+                            println!("  last attempt: {}", compact(last));
+                        }
+                    }
                 }
             }
         }
         UpdateCommand::Log { .. } => {
-            for entry in result.as_array().unwrap_or(&Vec::new()) {
-                println!("{}", compact(entry));
+            match serde_json::from_value::<Vec<proto::LogEntry>>(result.clone()) {
+                Err(_) => json(&result),
+                Ok(entries) => {
+                    for entry in entries {
+                        println!("{}", compact(&entry));
+                    }
+                }
             }
         }
         _ => json(&result),
     }
 }
 
-fn compact(value: &serde_json::Value) -> String {
+fn compact(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 #[cfg(test)]

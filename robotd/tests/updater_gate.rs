@@ -280,7 +280,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Every method the engine calls must be answered by the real binary.
 ///
 /// A `FakeRobot` cannot catch a method name or result field that disagrees between
-/// `robot-proto`'s two users, because it never serialises anything. This test is the only
+/// `duck-ipc-proto`'s two users, because it never serialises anything. This test is the only
 /// thing standing between a renamed field and a robot that silently reports Unreachable
 /// forever — which reverts every update, on every robot, with no error that names a
 /// cause.

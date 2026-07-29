@@ -131,7 +131,7 @@ enum Command {
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,
-        build = %robot_proto::build_info!(),
+        build = %updater::proto::build_info!(),
         exe = %std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into()),

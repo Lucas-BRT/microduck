@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use robot_proto as proto;
+use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -155,7 +155,7 @@ impl RobotState {
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,
-        build = %robot_proto::build_info!(),
+        build = %proto::build_info!(),
         exe = %std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into()),
@@ -346,7 +346,10 @@ async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<(
             continue;
         };
 
-        let response = dispatch(&state, id, &request.method);
+        let response = match request.as_call() {
+            Ok(call) => dispatch(&state, id, &call),
+            Err(e) => proto::Response::err(Some(id), e),
+        };
         write_line(&mut write_half, &response).await?;
     }
     Ok(())
@@ -356,58 +359,39 @@ async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<(
 ///
 /// Synchronous and allocation-light on purpose: these answers must be available even
 /// when everything else is broken.
-fn dispatch(state: &RobotState, id: proto::Id, method: &str) -> proto::Response {
-    let ok = |value: serde_json::Value| proto::Response {
-        jsonrpc: proto::JSONRPC_VERSION.to_owned(),
-        id: Some(id.clone()),
-        result: Some(value),
-        error: None,
-    };
-
-    let encode = |value: &dyn erased::Any| value.to_json();
-
-    match method {
-        proto::method::ROBOT_HEALTH => ok(encode(&state.health())),
-        proto::method::ROBOT_SAFE_TO_RESTART => ok(encode(&state.safe_to_restart())),
-        proto::method::ROBOT_MODEL_API => ok(encode(&proto::ModelApiResult {
-            model_api: MODEL_API,
-        })),
+fn dispatch(state: &RobotState, id: proto::Id, call: &proto::Call) -> proto::Response {
+    match call {
+        proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
+        proto::Call::RobotSafeToRestart => proto::Response::ok(Some(id), &state.safe_to_restart()),
+        proto::Call::RobotModelApi => proto::Response::ok(
+            Some(id),
+            &proto::ModelApiResult {
+                model_api: MODEL_API,
+            },
+        ),
         // The skeleton has no media stack, so no session can be live. `mediad` owns the
         // real answer (architecture.md §5.2); reporting `false` here is honest for now,
         // and the updater treats unknown as false anyway.
-        proto::method::ROBOT_SESSION_ACTIVE => {
-            ok(encode(&proto::SessionActiveResult { active: false }))
+        proto::Call::RobotRemoteSessionActive => {
+            proto::Response::ok(Some(id), &proto::SessionActiveResult { active: false })
         }
-        // Typed rather than hand-built JSON, for the same reason the `robot.*` results
-        // are: a hand-built object is where a field name drifts from what the client
-        // parses, and nothing catches it until a robot reports the wrong thing.
-        proto::method::HELLO => ok(encode(&proto::HelloResult {
-            api_version: proto::API_VERSION,
-            daemon_version: proto::semver::Version::parse(env!("CARGO_PKG_VERSION")).ok(),
-            revision: proto::build_info!().revision.map(str::to_owned),
-        })),
+        proto::Call::Hello(_) => proto::Response::ok(
+            Some(id),
+            &proto::HelloResult {
+                api_version: proto::API_VERSION,
+                daemon_version: proto::semver::Version::parse(env!("CARGO_PKG_VERSION")).ok(),
+                revision: proto::build_info!().revision.map(str::to_owned),
+            },
+        ),
+        // `update.*` is `updaterd`'s namespace. A client reaching here aimed at the wrong
+        // socket, so say that rather than report a generic failure.
         other => proto::Response::err(
             Some(id),
             proto::Error::new(
                 proto::code::METHOD_NOT_FOUND,
-                format!("unknown method {other:?}"),
+                format!("{} is not served by robotd", other.method()),
             ),
         ),
-    }
-}
-
-/// Tiny shim so `dispatch` can serialise several concrete result types through one
-/// closure without `dyn Serialize` (which isn't dyn-compatible).
-mod erased {
-    pub trait Any {
-        fn to_json(&self) -> serde_json::Value;
-    }
-    impl<T: serde::Serialize> Any for T {
-        fn to_json(&self) -> serde_json::Value {
-            // These types are plain structs of bools/strings/ints; serialisation cannot
-            // fail. Null would be a visible wrong answer rather than a silent one.
-            serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
-        }
     }
 }
 
@@ -471,29 +455,28 @@ mod tests {
     /// Every method must come back off `dispatch` in the shape the updater parses.
     ///
     /// The other health tests call `state.health()` directly, which type-checks but says
-    /// nothing about what goes over the socket — `dispatch` could return a completely
-    /// different JSON shape and they would all still pass. (Verified: it can, and they do.)
-    /// `tests/updater_gate.rs` catches that against a live process, but this runs in
-    /// microseconds and fails on the exact method, so it is the first line of defence.
+    /// nothing about what goes over the socket — `dispatch` could answer with a completely
+    /// different JSON shape and they would all still pass. `tests/updater_gate.rs` catches
+    /// that against a live process; this runs in microseconds and fails on the exact
+    /// method, so it is the first line of defence.
     #[test]
     fn dispatch_answers_every_method_in_the_typed_shape() {
         let s = state(false, false);
         s.running.store(true, Ordering::Relaxed);
         let id = || proto::Id::Number(1);
 
-        let health: proto::HealthResult = dispatch(&s, id(), proto::method::ROBOT_HEALTH)
+        let health: proto::HealthResult = dispatch(&s, id(), &proto::Call::RobotHealth)
             .result_as()
             .expect("robot.health must deserialize as HealthResult");
         assert!(health.healthy);
 
-        let safe: proto::SafeToRestartResult =
-            dispatch(&s, id(), proto::method::ROBOT_SAFE_TO_RESTART)
-                .result_as()
-                .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
+        let safe: proto::SafeToRestartResult = dispatch(&s, id(), &proto::Call::RobotSafeToRestart)
+            .result_as()
+            .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
 
         let session: proto::SessionActiveResult =
-            dispatch(&s, id(), proto::method::ROBOT_SESSION_ACTIVE)
+            dispatch(&s, id(), &proto::Call::RobotRemoteSessionActive)
                 .result_as()
                 .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
         assert!(!session.active);
@@ -516,17 +499,21 @@ mod tests {
         assert!(busy.reason.unwrap().contains("--busy"));
     }
 
+    /// `update.*` is a valid call that this daemon does not serve. It must be refused with
+    /// a message naming the right daemon, not answered with something invented.
     #[test]
-    fn unknown_methods_are_rejected_not_answered() {
+    fn calls_belonging_to_updaterd_are_refused() {
         let s = state(false, false);
-        let response = dispatch(&s, proto::Id::Number(1), "robot.doSomethingElse");
-        assert_eq!(response.error.unwrap().code, proto::code::METHOD_NOT_FOUND);
+        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::Status);
+        let error = response.error.expect("update.status must be refused");
+        assert_eq!(error.code, proto::code::METHOD_NOT_FOUND);
+        assert!(error.message.contains("robotd"), "{}", error.message);
     }
 
     #[test]
     fn model_api_is_reported() {
         let s = state(false, false);
-        let response = dispatch(&s, proto::Id::Number(1), proto::method::ROBOT_MODEL_API);
+        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::RobotModelApi);
         let result: proto::ModelApiResult = response.result_as().unwrap();
         assert_eq!(result.model_api, MODEL_API);
     }

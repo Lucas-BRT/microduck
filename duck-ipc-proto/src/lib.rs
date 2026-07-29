@@ -197,9 +197,10 @@ impl Call {
     /// The component this call is about, where it names one.
     pub fn component(&self) -> Option<&ComponentId> {
         match self {
-            Call::Check(p) | Call::Rollback(p) | Call::ResetToGolden(p) | Call::ListInstalled(p) => {
-                Some(&p.component)
-            }
+            Call::Check(p)
+            | Call::Rollback(p)
+            | Call::ResetToGolden(p)
+            | Call::ListInstalled(p) => Some(&p.component),
             Call::Apply(p) => Some(&p.component),
             Call::Select(p) => Some(&p.component),
             Call::Pin(p) => Some(&p.component),
@@ -216,9 +217,10 @@ impl Call {
         }
         match self {
             Call::Hello(p) => encode(p),
-            Call::Check(p) | Call::Rollback(p) | Call::ResetToGolden(p) | Call::ListInstalled(p) => {
-                encode(p)
-            }
+            Call::Check(p)
+            | Call::Rollback(p)
+            | Call::ResetToGolden(p)
+            | Call::ListInstalled(p) => encode(p),
             Call::Apply(p) => encode(p),
             Call::Select(p) => encode(p),
             Call::Pin(p) => encode(p),
