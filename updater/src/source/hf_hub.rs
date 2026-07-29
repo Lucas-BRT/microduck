@@ -165,7 +165,8 @@ impl Source for HfHub {
         let artifact = dest_dir.join(&artifact_name);
         let signature = dest_dir.join(format!("{artifact_name}{SIG_SUFFIX}"));
 
-        let bytes = http::download_to(&self.client, &artifact_url, &artifact, &progress).await?;
+        let bytes =
+            http::download_to(&self.client, &artifact_url, &artifact, None, &progress).await?;
 
         let sig_bytes = http::get_bytes(&self.client, &sig_url, None).await?;
         tokio::fs::write(&signature, &sig_bytes)

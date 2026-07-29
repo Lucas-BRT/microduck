@@ -406,6 +406,39 @@ done only when genuinely needed, never unconditionally on every update.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
+### 6.1 ⚠ A private repository cannot serve the fleet
+
+**Unresolved, and it constrains M4.** `pollen-robotics/miniduck_daemon` is private, and a
+private repo's `releases/download/<tag>/<asset>` URL returns **404 — with or without a
+token**. Verified directly:
+
+| URL | private repo |
+|---|---|
+| `https://github.com/<repo>/releases/download/<tag>/<asset>` | 404, authenticated or not |
+| `https://api.github.com/repos/<repo>/releases/assets/<id>` + `Accept: application/octet-stream` | 200 with a token |
+
+The engine now resolves every asset through the API endpoint, so a **developer's board**
+works: `GITHUB_TOKEN` is in the environment and `--ref` installs a branch build. Verified end
+to end against this repo.
+
+**A customer robot has no token, and should not.** A fleet-wide credential baked into an
+image is a credential that leaks and cannot be rotated without reflashing — the same problem
+the signing keys are tiered to avoid. So as things stand, robots in the field cannot download
+anything. The options, none of them chosen yet:
+
+| option | keeps zero-backend | notes |
+|---|---|---|
+| A **public repo holding only release artifacts** | yes | signatures are what make an artifact safe, not obscurity — a public artifact repo leaks build metadata and nothing else. Source stays private. |
+| Make this repo public | yes | product source; presumably not. |
+| An object store or CDN with a plain HTTP source | mostly | one more thing to own and pay for; the engine's source trait already abstracts it. |
+| A read-only token in the image | yes | rejected reasoning above: an unrotatable fleet credential. |
+
+The first is the conventional answer and costs nothing but a second repository. It does not
+change the engine — only `repo` in `updater.toml` and where `release.yml` publishes.
+
+Nothing about this blocks M2 or M3: dev boards have tokens and sim needs no downloads. It
+blocks the first robot that has to update itself without a developer present, which is M4.
+
 ## 7. `updaterd` state machine
 
 ```

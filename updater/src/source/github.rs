@@ -27,6 +27,9 @@ const MAX_PAGES: usize = 5;
 /// The signature that accompanies every signed file.
 const SIG_SUFFIX: &str = ".minisig";
 
+/// What the release-asset API needs to return bytes rather than JSON metadata.
+const OCTET_STREAM: &str = "application/octet-stream";
+
 pub struct GithubReleases {
     repo: String,
     tag_prefix: String,
@@ -51,6 +54,16 @@ struct Release {
 #[derive(Debug, Deserialize)]
 struct Asset {
     name: String,
+    /// The API endpoint for this asset, `/repos/{owner}/{repo}/releases/assets/{id}`.
+    ///
+    /// Used in preference to `browser_download_url` because that one **404s on a private
+    /// repository**, with or without a token — verified against this repo. The API endpoint
+    /// serves the bytes with a token and `Accept: application/octet-stream`, and works for
+    /// public repos too, so there is one path rather than two.
+    url: String,
+    /// Kept for diagnostics and for the public-repo case where a manifest's `url` already
+    /// points here.
+    #[allow(dead_code)]
     browser_download_url: String,
 }
 
@@ -154,12 +167,13 @@ impl GithubReleases {
         })
     }
 
+    /// The API download URL for a named asset. Pair it with [`OCTET_STREAM`].
     fn asset_url(release: &Release, name: &str) -> Result<String, Error> {
         release
             .assets
             .iter()
             .find(|a| a.name == name)
-            .map(|a| a.browser_download_url.clone())
+            .map(|a| a.url.clone())
             .ok_or_else(|| {
                 let available: Vec<_> = release.assets.iter().map(|a| a.name.as_str()).collect();
                 Error::Network(format!(
@@ -170,6 +184,34 @@ impl GithubReleases {
             })
     }
 
+    /// Where to actually fetch a URL from a signed manifest, and with which `Accept`.
+    ///
+    /// A manifest published by `release.yml` points at
+    /// `https://github.com/<repo>/releases/download/<tag>/<file>` — a URL that **404s on a
+    /// private repository**. When the URL is one of ours, the tag and filename are parsed out
+    /// and the asset is resolved through the release API instead, which serves bytes to a
+    /// token holder.
+    ///
+    /// **The repo path must match ours**, and that is the security-relevant part: the manifest
+    /// is untrusted at this point (its signature is checked after download), so a manifest
+    /// naming someone else's repository must not send an API request there. Anything that
+    /// does not match is fetched verbatim — a manifest pointing at a CDN keeps working, and
+    /// the bytes are verified by hash and signature either way.
+    async fn resolve_download(&self, url: &str) -> Result<(String, Option<&'static str>), Error> {
+        let prefix = format!("https://github.com/{}/releases/download/", self.repo);
+        let Some(rest) = url.strip_prefix(&prefix) else {
+            return Ok((url.to_owned(), None));
+        };
+        let Some((tag, name)) = rest.split_once('/') else {
+            return Ok((url.to_owned(), None));
+        };
+
+        let release = self.release_for_tag(tag).await?;
+        let api_url = Self::asset_url(&release, name)?;
+        tracing::debug!(%tag, %name, "resolved asset through the release API");
+        Ok((api_url, Some(OCTET_STREAM)))
+    }
+
     async fn signed_manifest(&self, tag: &str) -> Result<SignedBytes<Manifest>, Error> {
         let release = self.release_for_tag(tag).await?;
 
@@ -177,8 +219,8 @@ impl GithubReleases {
         let sig_name = format!("{}{SIG_SUFFIX}", self.manifest_asset);
         let sig_url = Self::asset_url(&release, &sig_name)?;
 
-        let bytes = http::get_bytes(&self.client, &manifest_url, None).await?;
-        let signature = http::get_bytes(&self.client, &sig_url, None).await?;
+        let bytes = http::get_bytes(&self.client, &manifest_url, Some(OCTET_STREAM)).await?;
+        let signature = http::get_bytes(&self.client, &sig_url, Some(OCTET_STREAM)).await?;
 
         // Parsed for convenience only; the *bytes* are what the caller verifies,
         // since the signature covers exactly what was received.
@@ -235,9 +277,12 @@ impl Source for GithubReleases {
         let artifact = dest_dir.join(&artifact_name);
         let signature = dest_dir.join(format!("{artifact_name}{SIG_SUFFIX}"));
 
-        let bytes = http::download_to(&self.client, &manifest.url, &artifact, &progress).await?;
+        let (artifact_url, accept) = self.resolve_download(&manifest.url).await?;
+        let bytes =
+            http::download_to(&self.client, &artifact_url, &artifact, accept, &progress).await?;
 
-        let sig_bytes = http::get_bytes(&self.client, &manifest.sig_url, None).await?;
+        let (sig_url, sig_accept) = self.resolve_download(&manifest.sig_url).await?;
+        let sig_bytes = http::get_bytes(&self.client, &sig_url, sig_accept).await?;
         tokio::fs::write(&signature, &sig_bytes)
             .await
             .map_err(|e| Error::Io {
@@ -341,12 +386,46 @@ mod tests {
             prerelease: false,
             assets: vec![Asset {
                 name: "other.txt".into(),
+                url: "https://api.github.com/repos/ORG/robot-daemon/releases/assets/1".into(),
                 browser_download_url: "https://example/other.txt".into(),
             }],
         };
         let err = GithubReleases::asset_url(&release, "manifest.json").unwrap_err();
         // A support ticket needs to see what *was* there.
         assert!(err.to_string().contains("other.txt"), "{err}");
+    }
+
+    /// **A manifest must not be able to redirect the asset lookup at another repository.**
+    ///
+    /// The manifest is untrusted where `resolve_download` runs — its signature is checked
+    /// after the bytes arrive — so a URL naming someone else's repo must be fetched verbatim
+    /// (and then fail verification) rather than turned into an API request against that repo
+    /// carrying our token.
+    #[test]
+    fn only_our_own_release_urls_are_rewritten() {
+        let s = source();
+        let prefix = "https://github.com/ORG/robot-daemon/releases/download/";
+
+        // Ours: the tag and filename are extractable.
+        let url = format!("{prefix}daemon-dev-my-branch/daemon-0.2.0-dev.1.abc1234.tar.zst");
+        let rest = url.strip_prefix(prefix).unwrap();
+        let (tag, name) = rest.split_once('/').unwrap();
+        assert_eq!(tag, "daemon-dev-my-branch");
+        assert_eq!(name, "daemon-0.2.0-dev.1.abc1234.tar.zst");
+
+        // Someone else's, and a non-GitHub host: neither carries our prefix, so both are
+        // left alone. Asserted on the prefix test itself because `resolve_download` would
+        // otherwise need the network to demonstrate it.
+        for foreign in [
+            "https://github.com/attacker/repo/releases/download/v1/x.tar.zst",
+            "https://cdn.example.com/daemon-1.0.0.tar.zst",
+        ] {
+            assert!(
+                foreign.strip_prefix(prefix).is_none(),
+                "{foreign} must not be treated as ours"
+            );
+        }
+        let _ = s;
     }
 
     #[test]
@@ -401,6 +480,7 @@ mod tests {
             "some_new_field": 42,
             "assets": [{
                 "name": "manifest.json",
+                "url": "https://api.github.com/repos/ORG/robot-daemon/releases/assets/7",
                 "browser_download_url": "https://example/m.json",
                 "another_new_field": true
             }]
@@ -408,5 +488,9 @@ mod tests {
         let release: Release = serde_json::from_value(json).unwrap();
         assert_eq!(release.tag_name, "daemon-v1.0.0");
         assert!(!release.draft, "missing `draft` should default to false");
+        // `url` is required, not defaulted: it is how assets are fetched, and a release whose
+        // assets lack it is not something to paper over with an empty string that would fail
+        // later as a confusing HTTP error.
+        assert!(release.assets[0].url.contains("/releases/assets/"));
     }
 }

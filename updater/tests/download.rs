@@ -132,6 +132,8 @@ async fn downloads_a_whole_file_and_reports_progress() {
         &http::client().unwrap(),
         &format!("http://{addr}/ranged"),
         &dest,
+        // No Accept header: these serve bytes directly, unlike GitHub's asset API.
+        None,
         &tx,
     )
     .await
@@ -171,6 +173,8 @@ async fn resumes_from_a_partial_file() {
         &http::client().unwrap(),
         &format!("http://{addr}/ranged"),
         &dest,
+        // No Accept header: these serve bytes directly, unlike GitHub's asset API.
+        None,
         &tx,
     )
     .await
@@ -204,6 +208,8 @@ async fn restarts_when_the_server_ignores_range() {
         &http::client().unwrap(),
         &format!("http://{addr}/ignores-range"),
         &dest,
+        // No Accept header: these serve bytes directly, unlike GitHub's asset API.
+        None,
         &tx,
     )
     .await
@@ -231,6 +237,8 @@ async fn a_missing_artifact_fails_immediately_without_retrying() {
         &http::client().unwrap(),
         &format!("http://{addr}/missing"),
         &dest,
+        // No Accept header: these serve bytes directly, unlike GitHub's asset API.
+        None,
         &tx,
     )
     .await
@@ -269,6 +277,8 @@ async fn a_server_error_is_retried_until_it_succeeds() {
         &http::client().unwrap(),
         &format!("http://{addr}/flaky"),
         &dest,
+        // No Accept header: these serve bytes directly, unlike GitHub's asset API.
+        None,
         &tx,
     )
     .await

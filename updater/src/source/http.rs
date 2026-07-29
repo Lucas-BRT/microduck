@@ -136,10 +136,17 @@ pub async fn get_bytes(
 ///
 /// Returns the number of bytes written. Integrity is **not** checked here — the
 /// caller verifies the hash and signature, which is the authoritative check.
+/// Stream `url` to `dest`, resuming a partial file if one is there.
+///
+/// `accept` exists for GitHub's release-asset API, which serves the *metadata* for an asset
+/// unless the request asks for `application/octet-stream`. Getting that wrong yields a JSON
+/// blob written to disk with an artifact's name, which then fails its hash check — a
+/// confusing way to discover a missing header.
 pub async fn download_to(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
+    accept: Option<&str>,
     progress: &ProgressSink,
 ) -> Result<u64, Error> {
     let mut last_error = None;
@@ -151,7 +158,7 @@ pub async fn download_to(
             tracing::info!(url, already, attempt, "resuming download");
         }
 
-        match attempt_download(client, url, dest, already, progress).await {
+        match attempt_download(client, url, dest, already, accept, progress).await {
             Ok(total) => return Ok(total),
             Err(e) => {
                 let retry = e.retry;
@@ -198,11 +205,15 @@ async fn attempt_download(
     url: &str,
     dest: &Path,
     resume_from: u64,
+    accept: Option<&str>,
     progress: &ProgressSink,
 ) -> Result<u64, AttemptError> {
     let mut request = client.get(url);
     if resume_from > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+    }
+    if let Some(accept) = accept {
+        request = request.header(reqwest::header::ACCEPT, accept);
     }
     if let Some(token) = github_token()
         && url.contains("github.com")

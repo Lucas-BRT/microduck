@@ -184,9 +184,21 @@ on the release stream with no special command, because `latest` resolves to the 
 **Done when:** a teammate pushes a branch, and I install it on a board with
 `robotctl update apply daemon --ref their-branch`, with rollback still working.
 
-**Not yet verified:** `dev.yml` has never run, and no board has installed by ref — the
-GitHub side of `manifest_at_ref` is exercised only by unit tests over the tag mapping, not
-against a real moving tag. That is the first thing to check once it publishes.
+**Verified end to end.** `dev.yml` published `daemon-dev-main` at
+`0.1.0-dev.2.8e8acb4`, and `robotctl update apply daemon --ref main` installed it from the
+real moving tag over the network. A customer-robot config refused the same build with
+"1 usable trusted key(s)" — the dev key was present in its trusted directory and still not
+counted, because `allow_dev_keys` was false. Both guards hold independently.
+
+Getting there turned up something that outlives M2: **a private repo's
+`releases/download/...` URL 404s even with a token**, so the engine now resolves assets
+through the release API endpoint. That fixes dev boards, where a developer has a token — and
+surfaces that a *customer* robot, which has none, cannot download from a private repo at all.
+See `updater-design.md` §6.1; it needs a decision before M4, and a public artifact-only
+repository is the cheap answer.
+
+Still untested on a board: `dev.yml`'s output has only been installed on macOS, so the
+aarch64 binaries in a dev build have never been executed. `ci.yml` covers that for `main`.
 
 ### M3 — `robotd` for real  ·  sim first
 
