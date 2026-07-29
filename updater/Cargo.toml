@@ -19,7 +19,7 @@ name = "updaterd"
 path = "src/main.rs"
 
 [dependencies]
-robot-proto = { path = "../robot-proto" }
+duck-ipc-proto = { path = "../duck-ipc-proto" }
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true

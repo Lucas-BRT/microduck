@@ -4,11 +4,16 @@
 # docs/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
 [workspace]
 resolver = "3"
-members = ["robot-proto", "updater", "robotctl", "robotd", "xtask"]
+members = ["duck-ipc-proto", "updater", "robotctl", "robotd", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
+# without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers
+# both. Declared so a teammate on an older toolchain gets "requires rustc 1.89" instead of
+# an error about a method that does not exist.
+rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]

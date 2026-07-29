@@ -15,12 +15,12 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | `robotd/` | heartbeat + the four `robot.*` methods, systemd unit — **skeleton done**; no control, no kinematics |
 | `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `robot-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
-| `.github/` | ci · release · promote — **written, never run** (no repo yet) |
+| `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, trust anchor, journald retention drop-in |
-| `scripts/` | `board-test.sh` — cross-compile + run on real ARM64 Linux; parked (needs Docker) |
+| `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64 across Debian Trixie, Ubuntu Noble and Debian Bookworm (glibc 2.36, the floor) |
 | tests | **229 passing**, including the health gate against a real `robotd` process |
-| missing | `mediad`, `btd`, `robot-config`, app, SDK, **git repo**, hardware |
+| missing | `mediad`, `btd`, `robot-config`, app, SDK, hardware |
 
 ## The framing
 
@@ -42,8 +42,9 @@ makes two things urgent that would otherwise have waited:
 1. **Dev-channel installs** — install a specific branch or commit on a board, without
    cutting a release. This is now ahead of `btd`: teammates will use `robotctl`, not the
    phone app.
-2. **A repo and a dev signing key**, because nothing can be shared until artifacts can
-   be signed and fetched.
+2. ~~**A repo and a dev signing key**~~ — **done.** `pollen-robotics/miniduck_daemon`
+   (private), CI green on first fix; `team.dev` key generated. Still outstanding before a
+   real release: the signing secrets and the `release` environment gate (`ci-setup.md`).
 
 `btd` and the app path slip behind both. They matter for *customers*, not for the team.
 

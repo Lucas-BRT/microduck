@@ -404,6 +404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "duck-ipc-proto"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1302,21 +1311,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "robot-proto"
-version = "0.1.0"
-dependencies = [
- "semver",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "robotctl"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "duck-ipc-proto",
  "libc",
- "robot-proto",
  "semver",
  "serde",
  "serde_json",
@@ -1327,9 +1327,9 @@ name = "robotd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "duck-ipc-proto",
  "libc",
  "minisign",
- "robot-proto",
  "semver",
  "serde",
  "serde_json",
@@ -2077,6 +2077,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "duck-ipc-proto",
  "fs4",
  "futures-util",
  "humantime-serde",
@@ -2084,7 +2085,6 @@ dependencies = [
  "minisign",
  "minisign-verify",
  "reqwest",
- "robot-proto",
  "semver",
  "serde",
  "serde_json",

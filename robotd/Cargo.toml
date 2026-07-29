@@ -6,7 +6,7 @@ license.workspace = true
 description = "Robot control daemon — skeleton"
 
 [dependencies]
-robot-proto = { path = "../robot-proto" }
+duck-ipc-proto = { path = "../duck-ipc-proto" }
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -14,7 +14,7 @@ description = "Local CLI for the robot — currently the `update` namespace only
 # http/tar/zstd/crypto tree, and structurally cannot now reach into engine internals
 # instead of going through the socket.
 [dependencies]
-robot-proto = { path = "../robot-proto" }
+duck-ipc-proto = { path = "../duck-ipc-proto" }
 semver.workspace = true
 clap = { version = "4.6.4", features = ["derive"] }
 serde_json.workspace = true

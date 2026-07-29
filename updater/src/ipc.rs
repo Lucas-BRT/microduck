@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 
 use crate::config::AutoApply;
 use crate::engine::{ApplyOptions, Engine};
-use crate::proto::{self, ComponentStatus, Id, Progress, Request, Response, method};
+use crate::proto::{self, Call, ComponentStatus, Id, Progress, Request, Response};
 
 /// How far a lagging subscriber may fall behind before it's dropped from the
 /// broadcast. Progress is advisory: a client that can't keep up gets a gap, never
@@ -468,13 +468,21 @@ impl Server {
                 continue;
             };
 
-            if request.method == method::SUBSCRIBE {
+            let call = match request.as_call() {
+                Ok(call) => call,
+                Err(e) => {
+                    write_line(&mut write_half, &Response::err(Some(id), e)).await?;
+                    continue;
+                }
+            };
+
+            if matches!(call, Call::Subscribe) {
                 // Streams until the peer goes away, so it owns the connection.
                 self.stream_progress(id, &mut write_half).await?;
                 continue;
             }
 
-            let response = self.dispatch(id, request, peer, &mut write_half).await;
+            let response = self.dispatch(id, call, peer, &mut write_half).await;
             write_line(&mut write_half, &response).await?;
         }
         Ok(())
@@ -483,28 +491,21 @@ impl Server {
     async fn dispatch(
         &self,
         id: Id,
-        request: Request,
+        call: Call,
         peer: Option<tokio::net::unix::UCred>,
         out: &mut tokio::net::unix::OwnedWriteHalf,
     ) -> Response {
-        macro_rules! params {
-            ($ty:ty) => {
-                match request.params_as::<$ty>() {
-                    Ok(params) => params,
-                    Err(e) => {
-                        return Response::err(
-                            Some(id),
-                            proto::Error::new(proto::code::INVALID_PARAMS, e.to_string()),
-                        );
-                    }
-                }
-            };
+        // One check covering every mutating call, rather than one per arm: a method added
+        // to `Call::is_mutating` is authorised by construction, and a new arm here cannot
+        // forget to ask.
+        if call.is_mutating()
+            && let Err(denied) = self.authorise(&id, &call, peer).await
+        {
+            return denied;
         }
 
-        match request.method.as_str() {
-            method::HELLO => {
-                let ok = |v: &_| ok_response(&id, v);
-                let params = params!(proto::HelloParams);
+        match call {
+            Call::Hello(params) => {
                 if params.api_version != proto::API_VERSION {
                     return Response::err(
                         Some(id),
@@ -518,50 +519,41 @@ impl Server {
                         ),
                     );
                 }
-                ok(&proto::HelloResult {
-                    api_version: proto::API_VERSION,
-                    daemon_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).ok(),
-                    revision: proto::build_info!().revision.map(str::to_owned),
-                })
+                Response::ok(
+                    Some(id),
+                    &proto::HelloResult {
+                        api_version: proto::API_VERSION,
+                        daemon_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).ok(),
+                        revision: proto::build_info!().revision.map(str::to_owned),
+                    },
+                )
             }
 
             // ── read-only ────────────────────────────────────────────────────
-            method::STATUS => match self.status().await {
-                Ok(status) => ok_response(&id, &status),
+            Call::Status => match self.status().await {
+                Ok(status) => Response::ok(Some(id), &status),
                 Err(e) => Response::err(Some(id), e.to_rpc_error()),
             },
-            method::LOG => {
-                let params = params!(proto::LogParams);
-                self.with_engine(id.clone(), |engine| engine.log(params.limit))
-                    .await
-                    .map_or_else(|e| e, |v| ok_response(&id, &v))
-            }
-            method::LIST_INSTALLED => {
-                let params = params!(proto::ComponentParams);
-                self.with_engine(id.clone(), |engine| {
+            Call::Log(params) => self
+                .with_engine(id.clone(), |engine| engine.log(params.limit))
+                .await
+                .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
+            Call::ListInstalled(params) => self
+                .with_engine(id.clone(), |engine| {
                     engine.list_installed(params.component.as_str())
                 })
                 .await
-                .map_or_else(|e| e, |v| ok_response(&id, &v))
-            }
-            method::CHECK => {
-                let params = params!(proto::ComponentParams);
+                .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
+            Call::Check(params) => {
                 let engine = self.engine.lock().await;
                 match engine.check(params.component.as_str()).await {
-                    Ok(result) => ok_response(&id, &result),
+                    Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
 
             // ── mutating ─────────────────────────────────────────────────────
-            method::APPLY => {
-                let params = params!(proto::ApplyParams);
-                if let Err(denied) = self
-                    .authorise(&id, &request.method, peer, Some(params.component.as_str()))
-                    .await
-                {
-                    return denied;
-                }
+            Call::Apply(params) => {
                 let component = params.component.0.clone();
                 self.run_mutating(id, out, move |engine, tx| {
                     Box::pin(async move {
@@ -580,72 +572,56 @@ impl Server {
                 })
                 .await
             }
-            method::ROLLBACK => {
-                let params = params!(proto::ComponentParams);
-                if let Err(denied) = self
-                    .authorise(&id, &request.method, peer, Some(params.component.as_str()))
-                    .await
-                {
-                    return denied;
-                }
-                let component = params.component.0.clone();
+            Call::Rollback(params) => {
+                let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {
                     Box::pin(async move { engine.rollback(&component).await })
                 })
                 .await
             }
-            method::RESET_TO_GOLDEN => {
-                let params = params!(proto::ComponentParams);
-                if let Err(denied) = self
-                    .authorise(&id, &request.method, peer, Some(params.component.as_str()))
-                    .await
-                {
-                    return denied;
-                }
-                let component = params.component.0.clone();
+            Call::ResetToGolden(params) => {
+                let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {
                     Box::pin(async move { engine.reset_to_golden(&component).await })
                 })
                 .await
             }
-            method::SELECT => {
-                let params = params!(proto::SelectParams);
-                if let Err(denied) = self
-                    .authorise(&id, &request.method, peer, Some(params.component.as_str()))
-                    .await
-                {
-                    return denied;
-                }
-                let component = params.component.0.clone();
-                let version = params.version.clone();
+            Call::Select(params) => {
+                let component = params.component.0;
+                let version = params.version;
                 self.run_mutating(id, out, move |engine, _tx| {
                     Box::pin(async move { engine.select(&component, &version).await })
                 })
                 .await
             }
-            method::PIN => {
-                let params = params!(proto::PinParams);
-                if let Err(denied) = self
-                    .authorise(&id, &request.method, peer, Some(params.component.as_str()))
-                    .await
-                {
-                    return denied;
-                }
+            Call::Pin(params) => {
                 let mut engine = self.engine.lock().await;
-                match engine
-                    .pin(params.component.as_str(), params.version.clone())
-                    .await
-                {
-                    Ok(()) => ok_response(&id, &serde_json::json!({})),
+                match engine.pin(params.component.as_str(), params.version).await {
+                    Ok(()) => Response::ok(Some(id), &serde_json::json!({})),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
 
-            other => Response::err(
+            // Owned by `handle_connection`, which hands the whole connection to
+            // `stream_progress` instead of answering once.
+            Call::Subscribe => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "subscribe is served on the connection, not dispatched",
+                ),
+            ),
+
+            // `robot.*` belongs to `robotd`. Reaching this means a client aimed the wrong
+            // socket, so name that rather than reporting a generic failure.
+            Call::RobotSafeToRestart
+            | Call::RobotHealth
+            | Call::RobotModelApi
+            | Call::RobotRemoteSessionActive => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    format!("unknown method {other:?}"),
+                    "robot.* is served by robotd, not updaterd",
                 ),
             ),
         }
