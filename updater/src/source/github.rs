@@ -180,30 +180,30 @@ impl GithubReleases {
             })
     }
 
+    /// Split one of our own release-download URLs into `(tag, asset name)`.
+    ///
+    /// `None` for anything else, including another repository's release URL — which matters
+    /// because the manifest this comes from is unverified at that point, so a URL naming a
+    /// foreign repo must not become an authenticated API request against it.
+    fn split_release_url(&self, url: &str) -> Option<(String, String)> {
+        let prefix = format!("https://github.com/{}/releases/download/", self.repo);
+        let (tag, name) = url.strip_prefix(&prefix)?.split_once('/')?;
+        Some((tag.to_owned(), name.to_owned()))
+    }
+
     /// Where to actually fetch a URL from a signed manifest, and with which `Accept`.
     ///
-    /// A manifest published by `release.yml` points at
-    /// `https://github.com/<repo>/releases/download/<tag>/<file>` — a URL that **404s on a
-    /// private repository**. When the URL is one of ours, the tag and filename are parsed out
-    /// and the asset is resolved through the release API instead, which serves bytes to a
-    /// token holder.
-    ///
-    /// **The repo path must match ours**, and that is the security-relevant part: the manifest
-    /// is untrusted at this point (its signature is checked after download), so a manifest
-    /// naming someone else's repository must not send an API request there. Anything that
-    /// does not match is fetched verbatim — a manifest pointing at a CDN keeps working, and
-    /// the bytes are verified by hash and signature either way.
+    /// A private repo's `releases/download/...` URL 404s even with a token, so one of ours is
+    /// re-resolved through the release API. Anything else is fetched verbatim — a manifest
+    /// pointing at a CDN keeps working, and the bytes are hash- and signature-checked either
+    /// way.
     async fn resolve_download(&self, url: &str) -> Result<(String, Option<&'static str>), Error> {
-        let prefix = format!("https://github.com/{}/releases/download/", self.repo);
-        let Some(rest) = url.strip_prefix(&prefix) else {
-            return Ok((url.to_owned(), None));
-        };
-        let Some((tag, name)) = rest.split_once('/') else {
+        let Some((tag, name)) = self.split_release_url(url) else {
             return Ok((url.to_owned(), None));
         };
 
-        let release = self.release_for_tag(tag).await?;
-        let api_url = Self::asset_url(&release, name)?;
+        let release = self.release_for_tag(&tag).await?;
+        let api_url = Self::asset_url(&release, &name)?;
         tracing::debug!(%tag, %name, "resolved asset through the release API");
         Ok((api_url, Some(OCTET_STREAM)))
     }
@@ -390,37 +390,33 @@ mod tests {
         assert!(err.to_string().contains("other.txt"), "{err}");
     }
 
-    /// **A manifest must not be able to redirect the asset lookup at another repository.**
+    /// **A manifest must not redirect the asset lookup at another repository.**
     ///
-    /// The manifest is untrusted where `resolve_download` runs — its signature is checked
-    /// after the bytes arrive — so a URL naming someone else's repo must be fetched verbatim
-    /// (and then fail verification) rather than turned into an API request against that repo
-    /// carrying our token.
+    /// `resolve_download` runs before the manifest's signature is checked, so a URL naming a
+    /// foreign repo must be left alone rather than turned into an API request carrying our
+    /// token.
     #[test]
-    fn only_our_own_release_urls_are_rewritten() {
+    fn only_our_own_release_urls_are_split() {
         let s = source();
-        let prefix = "https://github.com/ORG/robot-daemon/releases/download/";
 
-        // Ours: the tag and filename are extractable.
-        let url = format!("{prefix}daemon-dev-my-branch/daemon-0.2.0-dev.1.abc1234.tar.zst");
-        let rest = url.strip_prefix(prefix).unwrap();
-        let (tag, name) = rest.split_once('/').unwrap();
-        assert_eq!(tag, "daemon-dev-my-branch");
-        assert_eq!(name, "daemon-0.2.0-dev.1.abc1234.tar.zst");
+        assert_eq!(
+            s.split_release_url(
+                "https://github.com/ORG/robot-daemon/releases/download/daemon-dev-my-branch/daemon-0.2.0-dev.1.abc1234.tar.zst"
+            ),
+            Some((
+                "daemon-dev-my-branch".to_owned(),
+                "daemon-0.2.0-dev.1.abc1234.tar.zst".to_owned()
+            ))
+        );
 
-        // Someone else's, and a non-GitHub host: neither carries our prefix, so both are
-        // left alone. Asserted on the prefix test itself because `resolve_download` would
-        // otherwise need the network to demonstrate it.
         for foreign in [
             "https://github.com/attacker/repo/releases/download/v1/x.tar.zst",
             "https://cdn.example.com/daemon-1.0.0.tar.zst",
+            // Ours, but not a release-download URL.
+            "https://github.com/ORG/robot-daemon/archive/refs/heads/main.tar.gz",
         ] {
-            assert!(
-                foreign.strip_prefix(prefix).is_none(),
-                "{foreign} must not be treated as ours"
-            );
+            assert_eq!(s.split_release_url(foreign), None, "{foreign}");
         }
-        let _ = s;
     }
 
     #[test]

@@ -808,7 +808,6 @@ async fn auto_apply_all_installs_an_ordinary_update() {
 }
 
 /// The anti-loop guard has to cover the `all` policy too, and this is the test that says
-/// so — the guard used to be reachable only on the mandatory path.
 ///
 /// Without it, `auto_apply = all` plus one bad release is an endless cycle: apply, fail the
 /// gate, roll back, wait `check_interval`, re-download the artifact, rewrite the eMMC,

@@ -585,10 +585,9 @@ cause and refusing them would remove the obvious way to check. When the guard fi
 logs at `error` — a robot stuck below a mandatory floor needs a fixed release, and that
 should be loud.
 
-This was found by running the three daemons together rather than by reading the code: the
-symlink is back on the good release after every cycle, so nothing about the robot's *state*
-looks wrong. The test therefore counts attempts in the journal instead of checking the
-live version — the version assertion passes with the guard removed.
+The test for this counts attempts in the journal rather than checking the live version: after
+every cycle the symlink is back on the good release, so the robot's *state* looks correct even
+while the loop runs.
 
 
 The manifest's `min_supported` lets us force robots off a known-bad release
@@ -943,15 +942,9 @@ still no hardware) closes that. It spawns the actual binary and lets the real
 come back in the shape it parses, an update must gate and commit, and `robotd --unhealthy`
 must revert the *content* behind `current`, not merely the symlink.
 
-This tier is not theoretical insurance. Breaking `robotd`'s health reply to a different
-JSON shape — what a version-skewed daemon would send — was caught by nothing else: all
-190 other tests passed, including the protocol crate's own round-trip test (both sides
-share the struct, so it cannot detect skew) and `robotd`'s unit tests (which called the
-state accessor directly, bypassing dispatch). Two lessons were recorded in the code:
-a `dispatch`-level unit test now catches the same class in microseconds, and the
-integration test lives in `robotd/`'s package specifically so cargo *guarantees the
-binary is rebuilt* — deriving the path from `current_exe()` instead let a stale `robotd`
-be tested against a fresh client, which is indistinguishable from real drift.
+Nothing else covers this. The protocol crate's own round-trip tests cannot detect skew,
+because both sides share the struct; a `dispatch`-level unit test in `robotd` catches a
+changed reply shape cheaply, but only a real process exercises the socket itself.
 
 **Tier 2 — on-device acceptance (canary robots).** Hardware-dependent behavior
 (gait, motors, media) needs real boards. Keep a few **lab/canary robots** that
@@ -982,9 +975,9 @@ Three properties worth stating, because each is asserted rather than assumed:
 
 - **Promotion never rebuilds.** The stable manifest carries the staging `sha256` and
   points at the staging artifact URL, so the bytes clients receive are the bytes the
-  canary validated. Verified: promoting yields an identical digest.
+  canary validated; a test asserts the digest is unchanged.
 - **Artifacts are reproducible.** Fixed mtimes in the tar mean the same inputs produce
-  the same archive, so a rebuild can be compared against what shipped. Verified: two
+  the same archive, so a rebuild can be compared against what shipped; a test asserts two
   packages of the same inputs hash identically.
 - **`release.yml` verifies before publishing.** It installs the release through the real
   engine (`LocalDir` + `playground apply`) and asserts the binaries land executable. If

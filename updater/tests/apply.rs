@@ -1305,7 +1305,7 @@ async fn exact_version_may_still_go_backwards() {
 
 /// **§5.7** Robot-specific state must survive an update *and* a rollback.
 ///
-/// Called out as Tier-1 in §16.2 and previously untested. This is the promise that
+/// Tier-1 in §16.2. This is the promise that
 /// a client never has to recalibrate because of an update.
 #[tokio::test]
 async fn robot_specific_state_survives_update_and_rollback() {

@@ -1,23 +1,15 @@
 //! The health gate against a **real `robotd` process**, over a real unix socket.
 //!
-//! Everything in `apply.rs` uses a `FakeRobot` implementing [`RobotClient`] in-process.
-//! That is the right way to test the engine's *decisions*, but it proves nothing about
-//! the part most likely to break in the field: the wire. A `FakeRobot` cannot catch a
-//! method name that disagrees between the two crates, a result field spelled
-//! `is_healthy` on one side and `healthy` on the other, a socket with the wrong mode, or
-//! a `robotd` that accepts a connection and never answers.
+//! `apply.rs` covers the engine's *decisions* with an in-process `FakeRobot`, which never
+//! serialises anything and so cannot catch a disagreement about the wire: a renamed result
+//! field, a socket with the wrong mode, a `robotd` that accepts a connection and never
+//! answers. These tests spawn the actual binary instead.
 //!
-//! So these tests spawn the actual binary and let `SocketRobotClient` talk to it. This is
-//! the M1 done-test from `docs/roadmap.md`: an update health-gates against a running
-//! `robotd`, and a `robotd` that reports unhealthy triggers an automatic rollback.
+//! In `robotd/tests/` rather than `updater/tests/` because only here does cargo define
+//! `CARGO_BIN_EXE_robotd` and guarantee the binary is rebuilt first — see [`robotd_bin`].
 //!
-//! They live in `robotd/tests/` rather than `updater/tests/` so that cargo — not a path
-//! guess — supplies the binary, via `CARGO_BIN_EXE_robotd`. See [`robotd_bin`].
-//!
-//! Not covered here, deliberately: `on_apply = restart` via `systemctl`. There is no
-//! systemd on a dev laptop, and stubbing it would test the stub. That is M4's job, on the
-//! Radxa — see `docs/roadmap.md`.
-
+//! `on_apply = restart` is deliberately out of scope: there is no systemd in a container,
+//! and stubbing it would test the stub. That lands on hardware (`docs/roadmap.md` M4).
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -34,15 +26,9 @@ use updater::verify::KeyRing;
 
 /// Path to the `robotd` binary under test.
 ///
-/// `CARGO_BIN_EXE_robotd` is set by cargo for binaries of the package the test belongs
-/// to, and cargo guarantees the binary is **rebuilt before the test runs**. That freshness
-/// guarantee is the whole reason this file lives in `robotd/` rather than `updater/`.
-///
-/// The first version of this test derived the path from `current_exe()` instead, and
-/// checked only that the file existed. `cargo test --test <name>` does not rebuild sibling
-/// binaries, so it happily ran a *stale* robotd against a freshly built client — which
-/// looks exactly like the wire drift this file is meant to detect, and made a sabotage
-/// check appear to succeed when it had proved nothing.
+/// Cargo sets this only for binaries of the test's own package, and guarantees it is rebuilt
+/// first. Deriving the path by hand would risk testing a stale binary, which looks exactly
+/// like the wire drift this file exists to detect.
 fn robotd_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_robotd"))
 }

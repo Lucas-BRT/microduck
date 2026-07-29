@@ -22,8 +22,7 @@
 //!    (`docs/updater-design.md` §16.1).
 //!
 //! Therefore:
-//!  - **No prompts, ever.** The previous robot's update pain was an interactive
-//!    installer; nothing here may ask a question.
+//!  - **No prompts, ever.** Nothing here may ask a question.
 //!  - **Idempotent.** Re-running a command that already holds is success, so
 //!    scripts needn't branch on current state.
 //!  - **Exit codes are meaningful**, so tests assert on them without parsing text.

@@ -137,21 +137,10 @@ impl RobotState {
 
 /// The first line each daemon logs, before anything that can fail.
 ///
-/// Support's opening question is always "what was running?", and three facts answer it
-/// that a version number alone does not:
-///
-///   - **`exe`** — which release directory this process was launched from. After an update
-///     `updaterd` is still running the *previous* binary by design (it never restarts
-///     itself, `updater-design.md` §4.1), so `current` pointing at 0.3.0 while this line
-///     says `releases/0.2.0` is normal and needs to be visible rather than deduced.
-///   - **`revision`** — which commit. Two dev builds of the same version are otherwise
-///     indistinguishable, which is the normal case once branch installs land (M2).
-///   - **`pid`** — so a restart is distinguishable from a long-running process in a journal
-///     that spans reboots.
-///
-/// Logged at `warn` rather than `info`: the identity of the running build must survive
-/// `RUST_LOG=warn`, which is what a robot left running for weeks should be set to. It is
-/// one line per process start.
+/// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
+/// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
+/// still running the *previous* binary by design, so which release directory a process came
+/// from cannot be inferred (`docs/architecture.md` §8).
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,

@@ -255,9 +255,7 @@ pub enum HealthCheck {
     /// Ask `robotd` over its unix socket and wait for it to report healthy.
     ///
     /// No path here on purpose. The socket is one robot-wide fact, not a per-component
-    /// one, so it lives in [`Config::robot_socket`]. It used to be duplicated here and
-    /// was silently ignored — the client is built once, from the top-level value — which
-    /// is the worst kind of config field: one that looks load-bearing and does nothing.
+    /// one, so it lives in [`Config::robot_socket`].
     Socket {
         #[serde(with = "humantime_serde")]
         timeout: Duration,
@@ -432,22 +430,15 @@ mod tests {
 
     /// **Everything `on_apply` restarts must actually ship.**
     ///
-    /// This exists because it already went wrong. `on_apply` was flipped to
-    /// `restart units = ["robotd"]` in the same change that created `robotd` — but
-    /// `release.yml`'s hardcoded copy list still dated from when the artifact held only
-    /// `updaterd` and `robotctl`. The result would have been an artifact with no `robotd`
-    /// binary and no `robotd.service`, so `systemctl restart robotd` fails with "unit not
-    /// found", which fails the update, which rolls it back: every update, on every robot,
-    /// with the cause three files away from the symptom.
+    /// "What the daemon artifact contains" is stated in three places — this config, each
+    /// unit's `ExecStart`, and the release workflows' copy lists — and nothing else compares
+    /// them. An artifact missing a binary installs cleanly and then fails its own restart
+    /// step, which rolls the release back on every robot, with the cause three files away
+    /// from the symptom.
     ///
-    /// The underlying problem is that "what is in the daemon artifact" was stated in three
-    /// unlinked places — this config, each unit's `ExecStart`, and the release workflow —
-    /// and nothing compared them. This test compares them.
-    ///
-    /// The workflow is checked by string search rather than by parsing YAML: one assertion
-    /// does not justify a YAML dependency in the engine's dev-deps, and the strings being
-    /// searched for (a path and a binary name) are the exact things that must not go
-    /// missing.
+    /// The workflows are checked by string search rather than by parsing YAML: one assertion
+    /// does not justify a YAML dependency, and the strings searched for are exactly the ones
+    /// that must not go missing.
     #[test]
     fn every_unit_on_apply_restarts_is_actually_shipped() {
         let text = include_str!("../updater.example.toml");

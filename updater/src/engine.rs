@@ -307,11 +307,7 @@ impl Engine {
             .apply_inner(component, &cfg, &store, target, &options, &progress, &emit)
             .await;
 
-        // One logging path for every operation. This match used to be duplicated
-        // here and in `record`, and the two drifted: one recorded a rollback's `to`
-        // as the version that *failed*, the other as the version landed *on*.
-        // `known_bad` reads that field, so the disagreement blacklisted the
-        // known-good release. See `record`.
+        // Every operation logs through `record`, which owns what `to` means per outcome.
         self.record(component, installed, &outcome);
         outcome
     }
@@ -902,9 +898,8 @@ impl Engine {
 
     /// Append the outcome of an operation to the update log.
     ///
-    /// **The single place any operation writes an entry.** `apply`, `rollback`,
-    /// `select`, `reset_to_golden` and `recover_on_start` all route through here,
-    /// because when the logic was duplicated the copies drifted on what `to` meant.
+    /// The single place any operation writes an entry, so `to` cannot mean different things
+    /// in different paths.
     ///
     /// `to` names **the version the entry is about**:
     ///  - `Success` → the version now running,

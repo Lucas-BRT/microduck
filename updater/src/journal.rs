@@ -507,27 +507,14 @@ mod tests {
 
         drop(first);
 
-        // Bounded retry, not because release is asynchronous — it isn't; closing the
-        // descriptor releases the lock — but because this assertion flakes at a few
-        // percent when the whole suite runs in parallel on macOS, in a way I could
-        // not reproduce in isolation (3200 concurrent acquire/busy/drop/reacquire
-        // cycles in a standalone binary: zero failures).
-        //
-        // Production impact of a spurious `WouldBlock` is benign by design: the
-        // caller reports "busy", which is a normal answer the app already handles by
-        // retrying — not a failed update. So a retry here does not hide a defect
-        // that would matter, while a bare assertion makes CI unreliable.
-        //
-        // TODO: identify the interference. Suspect a descriptor for the lock file
-        // surviving in a subprocess spawned by another test.
-        let mut reacquired = None;
-        for _ in 0..20 {
-            if let Ok(Some(lock)) = UpdateLock::try_acquire(dir.path()) {
-                reacquired = Some(lock);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Closing the descriptor releases the lock, so this must succeed immediately.
+        // Distinguishing None from Err matters: "still held" and "could not open the file"
+        // have different causes and the bare assertion could not tell them apart.
+        let reacquired = match UpdateLock::try_acquire(dir.path()) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => panic!("lock still reported busy after the holder was dropped"),
+            Err(e) => panic!("re-acquire failed: {e}"),
+        };
         assert!(
             reacquired.is_some(),
             "lock should be free once the handle is dropped (dir={})",

@@ -52,153 +52,66 @@ makes two things urgent that would otherwise have waited:
 
 Each has a test that says "done", because milestones without one drift.
 
-### M1 — Close the loop  ·  no hardware needed  ·  **done**
+### M1 — Close the loop  ·  **done**
 
-The updater got something real to gate against, and the team got a shared crate boundary
-to build on.
+The updater got something real to gate against, and the team got a shared crate boundary.
 
-- ✅ **`robotd` skeleton.** A heartbeat loop plus a unix socket answering the four methods
-  `updaterd` calls — `robot.health`, `robot.safeToRestart`, `robot.modelApi`,
-  `robot.remoteSessionActive`. Its state is atomics rather than a mutex on purpose: a
-  robot whose control loop is wedged must still be able to answer "I am not healthy",
-  and if answering needed the loop's lock, the one case where `updaterd` needs an answer
-  is the case it would hang in. `--unhealthy` / `--busy` exercise rollback on a bench
-  robot without breaking a real build.
-- ✅ **Extracted `duck-ipc-proto`.** `robotd` and `robotctl` depend on it; `robotctl` no
-  longer depends on `updater` at all, which was the point — a support tool on the
-  recovery path should not link the update engine, and now structurally cannot reach
-  into its internals instead of going through the socket.
-- ✅ **The gate is real.** `on_apply` and `health` in `updater.example.toml` are off their
-  bootstrap values (§16.5); the test that pinned the inert state now asserts the opposite
-  direction, so a regression to `probe = "none"` — which would silently disable
-  auto-rollback and look like nothing in a diff — fails the build.
-- ✅ **One source of truth for the robotd socket.** `HealthCheck::Socket` used to carry a
-  `path` that was silently ignored (the client is built from a CLI flag), so a robot could
-  be configured to probe one socket and actually probe another. The field is gone; the
-  path is `robot_socket` at the top level of the config, and `--robot-socket` is a
-  documented dev override.
+- **`robotd` skeleton** — heartbeat plus the four `robot.*` methods `updaterd` calls. Its
+  state is atomics, not a mutex: a robot whose control loop is wedged must still be able to
+  answer "I am not healthy", and needing the loop's lock to answer would hang in exactly the
+  case that matters. `--unhealthy` / `--busy` exercise rollback on a bench robot.
+- **`duck-ipc-proto` extracted** — `robotd` and `robotctl` depend on it and not on `updater`,
+  so nothing on the recovery path links the engine's http/tar/crypto tree.
+- **The health gate is real** — `on_apply` restarts `robotd`, `health` is a socket probe, and
+  a test fails if either regresses to its inert bootstrap value.
+- **One source of truth for the robotd socket** — `robot_socket` at the top level of the
+  config; `--robot-socket` is a documented dev override.
+- **Logging and version reporting** — every daemon's first line is its own identity (version,
+  revision, exe path) at `warn`, so it survives `RUST_LOG=warn`; `robotctl version` reports
+  running *and* installed per service, because `updaterd` never restarts itself and so
+  legitimately lags until reboot.
+- **First-install bootstrap** — `updaterd install` + `scripts/install.sh`, through the
+  ordinary engine.
 
-**Done:** `updater_gate.rs` applies an update against a **real running `robotd` process**
-over a real socket and commits; a `robotd --unhealthy` fails the gate and the content
-behind `current` reverts to the previous release.
+**Done:** `robotd/tests/updater_gate.rs` gates an update against a real `robotd` process over
+a real socket and commits; `robotd --unhealthy` reverts the content behind `current`.
 
-Two things that test taught, worth keeping:
+`robot-config` was dropped from this milestone: M1's test is about the health gate, and a
+heartbeat daemon needs CLI flags, not a shared config store. It lands when something reads it.
 
-- It lives in `robotd/tests/` rather than `updater/tests/` because only there does cargo
-  define `CARGO_BIN_EXE_robotd` and **guarantee the binary is rebuilt** before the test
-  runs. The first version guessed the path from `current_exe()` and merely checked the
-  file existed — and `cargo test --test <name>` does not rebuild sibling binaries, so it
-  silently tested a stale `robotd`. A sabotage check appeared to pass while proving
-  nothing.
-- Sabotaging `robotd`'s health reply was caught **only** by these tests: all 190 others
-  passed, including `duck-ipc-proto`'s own round-trip test (both sides share the struct, so
-  it cannot detect skew) and `robotd`'s unit tests (they called `state.health()` directly,
-  bypassing dispatch). A `dispatch`-level unit test now closes that gap in microseconds;
-  the process-level test stays, because it is the only thing covering the socket itself.
+### M2 — Dev channel  ·  **done**
 
-Running the three binaries together — rather than only the automated tests — also turned
-up a live bug: the **unattended** path applied `Target::Latest` with no `known_bad` check,
-so a broken *mandatory* release (one carrying `min_supported`) would loop forever on every
-robot in the fleet — apply, fail the gate, roll back, wait, repeat, re-downloading and
-restarting `robotd` each cycle. Fixed and tested (§8.1). Worth noting *why* the test suite
-missed it: after each cycle the symlink is back on the good release, so nothing about the
-robot's state looks wrong. The new test counts attempts in the journal; asserting on the
-live version passes even with the guard removed.
+Install a branch on a board without cutting a release:
 
-A second gap the live run exposed: **`release.yml` never shipped `robotd`.** Its copy list
-dated from the bootstrap era (updaterd + robotctl), and M1 flipped `on_apply` to restart
-`robotd` without updating it — so the first real release would have installed cleanly, failed
-`systemctl restart robotd` with "unit not found", and rolled itself back on every robot. The
-cause was that "what the daemon artifact contains" was stated in three unlinked places: the
-workflow's copy list, `on_apply`'s units, and each unit's `ExecStart`. A test now compares
-them (`config.rs::every_unit_on_apply_restarts_is_actually_shipped`) and fails if a restarted
-unit has no crate, no unit file, or no line in the release workflow — verified by
-reintroducing the bug.
+```
+sudo robotctl update apply daemon --ref my-branch
+```
 
-**`robot-config` was deliberately dropped from M1.** It was listed here, but M1's
-done-test is about the health gate, and a heartbeat daemon needs CLI flags, not a shared
-config store. Building it now would be carried-but-not-deliverable code. It lands when
-something actually reads it — `btd`'s wifi provisioning in M6, or `robotd`'s calibration
-in M4, whichever comes first.
+- **`Target::Ref`** and `manifest_at_ref` on the source trait. `--ref` conflicts with
+  `--version` rather than one silently winning.
+- **`dev.yml`** — every branch push publishes `<crate>-dev.<run>.<sha7>` to the moving tag
+  `daemon-dev-<branch>`, signed with `team.dev`.
+- **`xtask package` accepts a prerelease of the crate version** without
+  `--allow-version-drift`, so the escape hatch stays reserved for what it was built for.
+- **Refs work on `local_dir`** too, which makes the path testable offline and is the sideload
+  story. A ref becomes a filename there, so separators and `..` are refused.
 
-### M2 — Dev channel  ·  no hardware needed  ·  **code done, unverified on a board**
+Two properties make this safe on every push, both enforced away from the workflow:
 
-Install a branch or commit on a board, over the air, without cutting a release.
+- A dev build **cannot become `latest`** — the version is a semver prerelease, and
+  `version_from_tag` refuses to read a dev tag as a release version.
+- A dev build **cannot install on a customer robot** — `allow_dev_keys` is false there, and a
+  trusted key only counts as a dev key if its filename ends `.dev.pub`.
 
-Most of the mechanism already exists and is deliberately shaped for this:
+A ref bypasses the downgrade guard by design: a prerelease always sorts below the release a
+board is on, so guarding it would refuse every branch install. A plain `apply` returns the
+board to the release stream, since `latest` resolves to the highest *stable* version.
 
-| Need | Status |
-|---|---|
-| Dev builds must never become fleet `latest` | ✅ two independent guards: GitHub's prerelease flag *and* a semver prerelease component |
-| Installing an older/non-linear version | ✅ `Target::Exact` bypasses the downgrade guard by design |
-| Dev builds signed with a separate key | ✅ `*.dev.pub` in the trusted set, gated by `allow_dev_keys` |
-| Rollback/prune/known-bad on dev versions | ✅ they're ordinary semver, so the store needs no changes |
-| Local sideload while iterating on your own board | ✅ `LocalDir` source, verification not relaxed |
+**Done:** verified against the real repository — `dev.yml` published, `--ref main` installed
+over the network, and a customer-robot config refused the same build.
 
-What's actually new:
-
-- **Version scheme.** Dev builds are `<next>-dev.<run>.<sha7>`, e.g.
-  `0.2.0-dev.5.abc1234`. Valid semver, unique per build, sorts *below* `0.2.0` — so a
-  dev build can never look like an upgrade from the release it precedes.
-- **A moving tag per branch.** CI on push publishes/replaces a prerelease tagged
-  `daemon-dev-<branch>`. The tag moves; the version inside is always unique.
-- **`Target::Ref(String)`** and `robotctl update apply daemon --ref my-branch`, so
-  nobody types a 40-character version. Needs a `manifest_at_tag()` on the GitHub source
-  and an `API_VERSION` bump (additive, but the enum changes).
-- **A dev key**, distinct from the release key, in every developer board's trusted set —
-  and *not* in a customer robot's.
-
-What landed:
-
-- ✅ **`Target::Ref(String)`**, `manifest_at_ref` on the source trait, and
-  `robotctl update apply daemon --ref my-branch`. `--ref` and `--version` conflict rather
-  than one silently winning. `API_VERSION` is 3.
-- ✅ **`dev.yml`** — every branch push cross-compiles, packages the same contents a release
-  ships, signs with `team.dev`, and replaces the prerelease at the moving tag
-  `daemon-dev-<branch>`.
-- ✅ **`xtask package` accepts a prerelease of the crate version** without
-  `--allow-version-drift`. Otherwise every branch build would need a flag documented as
-  "only for testing the tool itself", and it would stop catching what it exists for.
-- ✅ **Refs work on `local_dir` too**, which is what makes the whole path testable offline —
-  and is the sideload story. A ref becomes a filename there, so separators and `..` are
-  refused rather than sanitised.
-- ✅ The test that catches "the release forgot a binary" now checks **both** workflows: a dev
-  build missing `robotd` fails on the board identically, and a teammate hitting that would
-  blame their branch.
-
-Two properties worth restating because they are what makes this safe to run on every push:
-
-- A dev build **cannot become `latest`** — the version is a semver prerelease, so it sorts
-  below the release it precedes, and `version_from_tag` refuses to read a dev tag as a
-  release version. Tested from both directions.
-- A dev build **cannot install on a customer robot** — `allow_dev_keys = false` there, and a
-  trusted key only counts as a dev key if its filename ends `.dev.pub`. Two independent
-  conditions, neither of them a convention.
-
-A ref also has to bypass the downgrade guard, since a prerelease always sorts below the
-release a board is on — otherwise installing a branch onto an up-to-date board would be
-refused, which is every board people develop on. And a plain `apply` puts a dev board back
-on the release stream with no special command, because `latest` resolves to the highest
-*stable* version.
-
-**Done when:** a teammate pushes a branch, and I install it on a board with
-`robotctl update apply daemon --ref their-branch`, with rollback still working.
-
-**Verified end to end.** `dev.yml` published `daemon-dev-main` at
-`0.1.0-dev.2.8e8acb4`, and `robotctl update apply daemon --ref main` installed it from the
-real moving tag over the network. A customer-robot config refused the same build with
-"1 usable trusted key(s)" — the dev key was present in its trusted directory and still not
-counted, because `allow_dev_keys` was false. Both guards hold independently.
-
-Getting there turned up something that outlives M2: **a private repo's
-`releases/download/...` URL 404s even with a token**, so the engine now resolves assets
-through the release API endpoint. That fixes dev boards, where a developer has a token — and
-surfaces that a *customer* robot, which has none, cannot download from a private repo at all.
-See `updater-design.md` §6.1; it needs a decision before M4, and a public artifact-only
-repository is the cheap answer.
-
-Still untested on a board: `dev.yml`'s output has only been installed on macOS, so the
-aarch64 binaries in a dev build have never been executed. `ci.yml` covers that for `main`.
+**Open, and it blocks M4:** a private repo's release assets need a token, and a customer robot
+has none. See `updater-design.md` §6.1.
 
 ### M3 — `robotd` for real  ·  sim first
 

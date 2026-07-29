@@ -49,14 +49,10 @@ const INITIAL_CHECK_DELAY: Duration = Duration::from_secs(60);
 
 /// Who may perform mutating operations.
 ///
-/// `SO_PEERCRED` was previously *logged* and never enforced, which meant the entire
-/// security boundary was the socket's 0660 mode. That is thin for a device where a
-/// BLE-facing service is one of the clients: group membership says "may talk to
-/// updaterd", not "may replace the firmware". This is the enforcement.
-///
-/// Deliberately **not** applied to read-only requests: reaching the socket already
-/// requires its group, and support must be able to inspect a robot without being
-/// authorised to change it.
+/// Two tiers. Reaching the socket at all requires its group (mode 0660); *mutating*
+/// additionally requires being listed here. So support can inspect a robot without being
+/// able to change it, and a BLE-facing client's group membership does not amount to "may
+/// replace the firmware".
 #[derive(Debug, Clone)]
 pub struct PeerPolicy {
     /// The uid `updaterd` runs as. Always permitted — it can stop or replace the
@@ -316,23 +312,11 @@ impl Server {
                         continue;
                     }
 
-                    // A candidate this robot already rolled back from must not be applied
-                    // again without a human — whatever the policy, and even when the
-                    // release is mandatory.
-                    //
-                    // Without this, a bad release puts the fleet into a permanent cycle:
-                    // check says available, apply, gate fails, roll back, wait
-                    // `check_interval`, repeat. Every iteration re-downloads the artifact,
-                    // rewrites the eMMC and restarts `robotd` — so the robot is unusable
-                    // *and* wearing out, on battery, with no way for the loop to end on
-                    // its own.
-                    //
-                    // Deliberately not applied to an explicit `update apply`: an operator
-                    // retrying a release may have fixed the cause, and refusing them would
-                    // remove the obvious way to test that. `known_bad` is latest-outcome,
-                    // so one successful apply clears it. That asymmetry is also why this
-                    // scheduler cannot be replaced by cron calling `robotctl` — see
-                    // [`Self::spawn_periodic_checks`].
+                    // Never reapply a release this robot already rolled back from —
+                    // otherwise a bad one loops forever, re-downloading and restarting every
+                    // interval. An explicit `update apply` still retries, which is why a cron
+                    // job driving `robotctl` is not a substitute for this scheduler
+                    // (`updater-design.md` §8.1.1).
                     let known_bad = match self.engine.try_lock() {
                         Ok(engine) => engine.known_bad(&component),
                         Err(_) => return,
