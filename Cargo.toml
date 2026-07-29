@@ -1,0 +1,30 @@
+# Workspace root for the robot daemon.
+#
+# One crate per service or tool, matching the service split in
+# docs/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
+[workspace]
+resolver = "3"
+members = ["robot-proto", "updater", "robotctl", "robotd", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = { version = "1", features = ["serde"] }
+thiserror = "2"
+tokio = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# No custom [profile.release]. Binary size is not worth optimising for: model artifacts
+# will dwarf a few MB of binary, and the tuning cost more than it bought —
+# `strip = true` in particular removes the symbol table, turning a panic backtrace in
+# journald into bare addresses, which is exactly what you need when diagnosing a robot
+# you cannot attach a debugger to. `lto`/`codegen-units` only lengthened builds.

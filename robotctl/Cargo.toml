@@ -1,0 +1,22 @@
+[package]
+name = "robotctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local CLI for the robot — currently the `update` namespace only"
+
+# Its own crate rather than a binary of `updater`, because its role is broader:
+# it will front `robotd` and other services too. Today it only implements
+# `robotctl update …`.
+#
+# Depends on `robot-proto` alone, not on `updater`. That was the point of extracting the
+# protocol: a support tool on the recovery path should not link the update engine's
+# http/tar/zstd/crypto tree, and structurally cannot now reach into engine internals
+# instead of going through the socket.
+[dependencies]
+robot-proto = { path = "../robot-proto" }
+semver.workspace = true
+clap = { version = "4.6.4", features = ["derive"] }
+serde_json.workspace = true
+serde.workspace = true
+libc = "0.2.189"

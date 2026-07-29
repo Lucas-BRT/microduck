@@ -1,0 +1,83 @@
+# Checks on every push and pull request.
+#
+# Split into two jobs deliberately: `check` is fast and catches most things, `board`
+# is slower and catches the class of problem that only appears off the dev machine
+# (cross-linking, glibc floors, unix-socket and permission semantics).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs: during a hot iteration week the queue is otherwise mostly
+# obsolete builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI only. Locally a warning shouldn't block you mid-edit.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+      # `scripts/install.sh` is the one piece of this repo that runs on a robot without
+      # being compiled, so nothing else would catch a typo in it until someone tried to
+      # provision a board. shellcheck is on the ubuntu runner image already.
+      #
+      # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
+      # a bashism would work on a dev box and fail on the board.
+      - name: Lint the installer
+        run: |
+          sh -n scripts/install.sh
+          shellcheck --shell=sh scripts/install.sh
+          # The one-liner is only correct if the file is executable and self-contained.
+          test -x scripts/install.sh
+
+      # The publish tooling must keep working, or a release can't be cut. Cheap to
+      # assert here rather than discovering it at tag time.
+      - name: xtask smoke test
+        run: |
+          mkdir -p /tmp/bin && cp target/debug/robotctl /tmp/bin/
+          cargo run -p xtask -- package \
+            --version "$(cargo metadata --format-version 1 --no-deps \
+                          | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')" \
+            --bin-dir /tmp/bin --out /tmp/dist
+          test -f /tmp/dist/manifest.json
+
+  board:
+    # The target is aarch64; this is the only job that proves the binaries run there.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: mlugg/setup-zig@v1
+      - run: cargo install cargo-zigbuild --locked
+
+      # arm64 containers on an x86_64 runner need emulation; on arm64 runners this is
+      # a no-op. Kept so the job works on either.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - run: ./scripts/board-test.sh

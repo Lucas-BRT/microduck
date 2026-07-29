@@ -1,0 +1,183 @@
+#!/bin/sh
+# Cross-compile for the board and exercise the result on real ARM64 Linux.
+#
+# Target: Radxa Zero 3 (RK3566, Cortex-A55 → aarch64) running Armbian 26.2.x.
+#
+# The intended userland is Debian 13 (Trixie). Armbian 26.2 also offers Ubuntu Noble
+# and a minimal Debian Bookworm, so we build against an older glibc than any of them
+# and verify against all three — Trixie first, since that is what will be flashed.
+# Keeping the floor low costs nothing and means a fallback image needs no rebuild.
+#
+# The kernel (6.1.115 Rockchip BSP) is irrelevant to us: flock, SO_PEERCRED and
+# statvfs long predate it.
+#
+# Not a substitute for hardware, but it catches everything that only appears off the
+# dev machine: cross-linking (notably `zstd`'s C code), glibc floors, unix-socket and
+# file-permission semantics, and anything that quietly depended on macOS. On an Apple
+# Silicon host these containers run arm64 *natively*, so it's fast and not emulated.
+#
+# Usage:  scripts/board-test.sh
+#
+# Requires: cargo-zigbuild, zig, docker.
+
+set -eu
+
+TARGET_DIR=target/aarch64-unknown-linux-gnu/release
+
+# Build floor. Below every Armbian 26.2 userland (Bookworm 2.36, Noble 2.39,
+# Trixie 2.41) so one binary serves all of them — and below Bullseye/Focal (2.31) too,
+# which costs nothing and removes a way to get stranded.
+GLIBC_FLOOR=2.31
+
+
+# Trixie first: it is the target. The others are fallbacks Armbian also offers.
+IMAGES="debian:trixie-slim ubuntu:noble debian:bookworm-slim"
+
+# Checked up front: otherwise the build succeeds and the run fails several minutes
+# later with Docker's own error, which reads like a problem with the code.
+if ! docker info >/dev/null 2>&1; then
+    echo "error: cannot reach the Docker daemon." >&2
+    echo "       The cross-build would succeed, but the binaries could not be run." >&2
+    echo "       Start Docker (or Colima/OrbStack) and retry." >&2
+    exit 1
+fi
+
+echo "==> cross-compiling for aarch64-unknown-linux-gnu (glibc <= $GLIBC_FLOOR)"
+cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" --bins
+cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" \
+    -p updater --example playground
+
+echo
+echo "==> what we built"
+file "$TARGET_DIR/updaterd" | sed 's/^/    /'
+
+# The highest glibc symbol version is what actually determines the minimum OS.
+# Building against a newer glibc links cleanly here and fails on the board, so assert
+# it rather than assume.
+NEEDS=$(strings "$TARGET_DIR/updaterd" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1)
+echo "    needs $NEEDS"
+# Sort the two and check ours isn't the larger.
+if [ "$(printf '%s\n%s\n' "GLIBC_$GLIBC_FLOOR" "$NEEDS" | sort -V | tail -1)" != "GLIBC_$GLIBC_FLOOR" ]; then
+    echo "    [FAIL] needs $NEEDS, above the $GLIBC_FLOOR floor"
+    exit 1
+fi
+
+# Checks run identically against each userland; kept in one place so a new image is
+# one word in $IMAGES.
+CHECKS='
+set -eu
+P=/bin/robot/examples/playground
+R=/bin/robot/robotctl
+
+echo "    $(uname -m), $(ldd --version 2>&1 | head -1)"
+
+# ── engine, driven directly ──
+$P init /tmp/duck >/dev/null
+$P publish /tmp/duck 1.0.0 >/dev/null
+$P apply /tmp/duck >/dev/null
+$P status /tmp/duck | grep -q "daemon: 1.0.0"
+echo "    [ok] installed 1.0.0"
+
+# An unhealthy robot must revert, content and all.
+$P publish /tmp/duck 1.1.0 >/dev/null
+$P apply /tmp/duck --unhealthy 2>&1 | grep -q "ROLLED BACK"
+$P status /tmp/duck | grep -q "daemon: 1.0.0"
+echo "    [ok] unhealthy release rolled back"
+
+# A tampered artifact must be refused with nothing installed.
+$P publish /tmp/duck 1.2.0 --tamper >/dev/null
+$P apply /tmp/duck 2>&1 | grep -q "REFUSED (code 6)"
+echo "    [ok] tampered artifact refused"
+
+# Crash after the swap, then two boots: the boot counter must revert it.
+$P publish /tmp/duck 2.0.0 >/dev/null
+$P apply /tmp/duck --fault abort_after_swap >/dev/null 2>&1 || true
+$P recover /tmp/duck >/dev/null
+$P recover /tmp/duck 2>&1 | grep -q "ROLLED BACK"
+$P status /tmp/duck | grep -q "daemon: 1.0.0"
+echo "    [ok] crash after swap reverted by boot counter"
+
+# Piping must not panic: Rust ignores SIGPIPE, so `| head` used to abort.
+$P log /tmp/duck | head -1 >/dev/null
+echo "    [ok] output survives a closed pipe"
+
+# ── daemon + CLI over a real unix socket ──
+sed -i "s|health = .*|health = { probe = \"none\" }|" /tmp/duck/updater.toml
+RUST_LOG=info /bin/robot/updaterd \
+    --config /tmp/duck/updater.toml --socket /tmp/duck/d.sock >/tmp/d.log 2>&1 &
+DAEMON=$!
+i=0
+while [ ! -S /tmp/duck/d.sock ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
+test -S /tmp/duck/d.sock
+
+# Group-restricted, not world-writable: anyone who can write here can update firmware.
+test "$(stat -c %A /tmp/duck/d.sock)" = "srw-rw----"
+echo "    [ok] socket is srw-rw---- (0660)"
+
+$R --socket /tmp/duck/d.sock update status >/dev/null
+$P publish /tmp/duck 3.0.0 >/dev/null
+$R --socket /tmp/duck/d.sock update apply daemon >/dev/null 2>&1
+$R --socket /tmp/duck/d.sock update status | grep -q "3.0.0"
+echo "    [ok] robotctl apply over the socket"
+
+# SO_PEERCRED is enforced, and the audit line is what support reads.
+grep -q "mutating request" /tmp/d.log
+echo "    [ok] peer credentials recorded"
+
+# An unreachable daemon must be its own exit code, so a script can tell "not running"
+# from "rejected". `|| code=$?` keeps set -e from treating the expected failure as
+# fatal.
+code=0
+$R --socket /tmp/nope.sock update status >/dev/null 2>&1 || code=$?
+test "$code" -eq 3 || { echo "    [FAIL] expected exit 3, got $code"; exit 1; }
+echo "    [ok] unreachable daemon exits 3"
+
+kill $DAEMON 2>/dev/null || true
+
+# ── layered access control, as the systemd unit configures it ──
+# Only meaningful on Linux, so this is the only place it can be tested.
+groupadd -r robot 2>/dev/null || true
+useradd -r -G robot member 2>/dev/null || true
+useradd -r outsider 2>/dev/null || true
+
+# `Group=robot` in the unit is what makes mode 0660 mean "the robot group" rather than
+# "root only" — the socket inherits the process primary group.
+setpriv --regid robot --clear-groups \
+    /bin/robot/updaterd --config /tmp/duck/updater.toml --socket /run/u.sock \
+    >/tmp/d2.log 2>&1 &
+DAEMON2=$!
+i=0
+while [ ! -S /run/u.sock ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
+test "$(stat -c %U:%G /run/u.sock)" = "root:robot"
+echo "    [ok] socket is root:robot when the unit sets Group=robot"
+
+# Layer 1: the group decides who may talk to the daemon at all.
+su member -s /bin/sh -c "/bin/robot/robotctl --socket /run/u.sock update status" >/dev/null
+echo "    [ok] group member can read"
+
+code=0
+su outsider -s /bin/sh -c "/bin/robot/robotctl --socket /run/u.sock update status" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 3 || { echo "    [FAIL] non-member should be blocked, got $code"; exit 1; }
+echo "    [ok] non-member blocked by socket mode"
+
+# Layer 2: talking is not the same as being allowed to change the robot.
+code=0
+su member -s /bin/sh -c "/bin/robot/robotctl --socket /run/u.sock update apply daemon" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 6 || { echo "    [FAIL] member should be denied (6), got $code"; exit 1; }
+echo "    [ok] group member cannot mutate (exit 6, denied)"
+
+kill $DAEMON2 2>/dev/null || true
+'
+
+for image in $IMAGES; do
+    echo
+    echo "==> $image"
+    docker run --rm --platform linux/arm64 \
+        -v "$PWD/$TARGET_DIR:/bin/robot:ro" \
+        "$image" sh -c "$CHECKS"
+done
+
+echo
+echo "==> all board checks passed on: $IMAGES"

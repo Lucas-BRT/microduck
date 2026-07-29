@@ -1,0 +1,609 @@
+//! `updaterd` — the update daemon.
+//!
+//! Deliberately thin: parse args, load config, recover from any interrupted run,
+//! then serve. All logic lives in the library so it can be tested without a
+//! socket or a robot.
+//!
+//! **Startup order matters.** `Engine::recover_on_start` runs *before* the socket
+//! is served, so a robot that booted into a bad release has already begun
+//! reverting by the time anything can ask it to do something else.
+//!
+//! This process must be resident and must exclude *itself* from the units it
+//! restarts — see `docs/updater-design.md` §4.
+//!
+//! **Resident is about triggers, not about applying.** Applying an update is a library
+//! call, and mutual exclusion is a file lock in `state_dir` rather than a property of
+//! there being one process ([`updater::engine::Engine::apply`]). What needs a daemon is
+//! everything *around* an update: a socket for the app to trigger through, progress to
+//! stream back, a timer so a mandatory release can pull a robot forward with nobody
+//! present, and a process at boot for the boot counter to recover through. None of that
+//! applies to a robot's first install, which is what the `install` subcommand is for.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+
+const DEFAULT_CONFIG: &str = "/etc/robot/updater.toml";
+
+#[derive(Parser, Debug)]
+#[command(name = "updaterd", about = "Robot update daemon", version)]
+struct Args {
+    /// Path to updater.toml.
+    #[arg(long, global = true, default_value = DEFAULT_CONFIG)]
+    config: PathBuf,
+
+    /// Socket to listen on.
+    #[arg(long, global = true, default_value = updater::proto::DEFAULT_SOCKET)]
+    socket: PathBuf,
+
+    /// `robotd`'s socket, used for the safe-to-restart and health probes.
+    ///
+    /// Absent or silent is fine — the engine treats an unreachable `robotd` as a
+    /// normal state (`docs/architecture.md` §1.1).
+    /// Overrides `robot_socket` in the config. For running two updaterd instances on one
+    /// dev box, or pointing at a stub robotd; a real deployment sets it in the config.
+    #[arg(long, global = true)]
+    robot_socket: Option<PathBuf>,
+
+    /// Run boot recovery, report what it would do, and exit without serving.
+    #[arg(long, global = true)]
+    check_only: bool,
+
+    /// Enable a fault injection point (repeatable). Test/bench only — refused
+    /// unless the config allows it, and never set on a client robot.
+    ///
+    /// See [`updater::faults::Faults`] for the available points.
+    #[arg(long = "inject-fault", value_name = "FAULT", global = true)]
+    faults: Vec<String>,
+
+    /// Absent means "serve", which is how systemd starts it.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install a component's first release from a local directory, then exit.
+    ///
+    /// The bootstrap path: how a robot that has never been updated gets the release
+    /// containing the very daemon that would otherwise have to already be running. It
+    /// runs the ordinary [`updater::engine::Engine::apply`] — signature verification,
+    /// extraction, the atomic swap, the journal entry — so the store and the update log
+    /// come out in exactly the state the resident daemon expects on its first start.
+    /// There is no bootstrap-only code path to drift from the real one.
+    ///
+    /// Two settings are forced for the duration, because on a robot with no release
+    /// installed they are facts rather than policy:
+    ///
+    ///   - `on_apply` → `none`. The units live *inside* the release being installed, so
+    ///     there is nothing to restart yet and `systemctl restart` would fail, failing
+    ///     the update.
+    ///   - `health` → `none`. A `probe = "socket"` gate asks `robotd`, which cannot be
+    ///     running before its binary exists; the gate would fail and revert to nothing.
+    ///     `updater/tests/apply.rs` pins that behaviour against an absent robot.
+    ///
+    /// Which is why this refuses to run once a release *is* live: those overrides would
+    /// then silently disable auto-rollback on a working robot. Use
+    /// `robotctl update apply` there — it goes through the daemon, with the real gate.
+    Install {
+        /// Install from a local directory instead of the configured source.
+        ///
+        /// Omit it on a robot with a network: the configured `github_releases` source
+        /// resolves `latest` itself, which is what the one-line installer relies on —
+        /// otherwise it would have to parse a signed manifest in shell to learn the
+        /// version and the artifact URL.
+        ///
+        /// Supply it for an offline or factory install, or to sideload a build. The
+        /// directory holds `<version>.manifest.json`, its `.minisig`, the artifact and
+        /// the artifact's `.minisig` — the layout `updater::source::local` expects.
+        #[arg(long)]
+        from: Option<PathBuf>,
+
+        /// Component to install. The default is the one that carries the daemons.
+        #[arg(long, default_value = "daemon")]
+        component: String,
+
+        /// Verify everything and stop before the swap. Checks a downloaded release is
+        /// installable without committing to it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// The first line each daemon logs, before anything that can fail.
+///
+/// Support's opening question is always "what was running?", and three facts answer it
+/// that a version number alone does not:
+///
+///   - **`exe`** — which release directory this process was launched from. After an update
+///     `updaterd` is still running the *previous* binary by design (it never restarts
+///     itself, `updater-design.md` §4.1), so `current` pointing at 0.3.0 while this line
+///     says `releases/0.2.0` is normal and needs to be visible rather than deduced.
+///   - **`revision`** — which commit. Two dev builds of the same version are otherwise
+///     indistinguishable, which is the normal case once branch installs land (M2).
+///   - **`pid`** — so a restart is distinguishable from a long-running process in a journal
+///     that spans reboots.
+///
+/// Logged at `warn` rather than `info`: the identity of the running build must survive
+/// `RUST_LOG=warn`, which is what a robot left running for weeks should be set to. It is
+/// one line per process start.
+fn log_startup_identity(service: &str) {
+    tracing::warn!(
+        service,
+        build = %robot_proto::build_info!(),
+        exe = %std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".into()),
+        pid = std::process::id(),
+        "starting"
+    );
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = Args::parse();
+
+    // Log to stderr; systemd captures it into the journal. Level via RUST_LOG.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    log_startup_identity("updaterd");
+
+    match args.command {
+        Some(Command::Install {
+            ref from,
+            ref component,
+            dry_run,
+        }) => install(&args, from.clone(), component, dry_run).await,
+        None => serve(args).await,
+    }
+}
+
+/// What both entry points need, loaded identically.
+///
+/// Split out so `serve` and `install` cannot diverge on the two things that must fail
+/// loudly — a bad config and an unusable keyring. A bootstrap path that was lenient
+/// about either would be a hole in the trust chain reachable exactly once per robot,
+/// which is the worst possible time for it to be there.
+struct Loaded {
+    config: updater::config::Config,
+    keys: updater::verify::KeyRing,
+    robot: Box<dyn updater::robot::RobotClient>,
+    faults: updater::faults::Faults,
+}
+
+/// `None` means the failure was already logged with its context.
+fn load(args: &Args) -> Option<Loaded> {
+    // Config and keyring first: both must fail loudly. A bad config that silently
+    // left the robot unable to update would be invisible until it mattered.
+    let config = match updater::config::Config::load(&args.config) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(path = %args.config.display(), error = %e, "invalid config");
+            return None;
+        }
+    };
+
+    // Refused unless the config permits it, so a client robot cannot be told to
+    // fail on purpose.
+    let faults =
+        match updater::faults::Faults::from_names(&args.faults, config.allow_fault_injection) {
+            Ok(faults) => faults,
+            Err(e) => {
+                tracing::error!(error = %e, "fault injection refused");
+                return None;
+            }
+        };
+    if faults.any_enabled() {
+        tracing::warn!(
+            ?faults,
+            "FAULT INJECTION ACTIVE — this build will fail on purpose"
+        );
+    }
+
+    // An empty trusted-keys directory is fatal, never an empty allow-list: silently
+    // trusting nothing looks identical to a misconfigured path.
+    let keys = match updater::verify::KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys)
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(error = %e, "could not load trusted keys");
+            return None;
+        }
+    };
+
+    // `robotd` may well not be running — that is a normal, expected state, and the
+    // client reports Unreachable rather than failing.
+    let robot_socket = args
+        .robot_socket
+        .clone()
+        .unwrap_or_else(|| config.robot_socket.clone());
+    tracing::info!(path = %robot_socket.display(), "robotd socket");
+    let robot: Box<dyn updater::robot::RobotClient> =
+        Box::new(updater::robot::SocketRobotClient::new(robot_socket));
+
+    Some(Loaded {
+        config,
+        keys,
+        robot,
+        faults,
+    })
+}
+
+/// Install the first release from a local directory, synchronously, and exit.
+///
+/// See [`Command::Install`] for why this exists and why it refuses to run on a robot
+/// that already has a release live.
+async fn install(args: &Args, from: Option<PathBuf>, component: &str, dry_run: bool) -> ExitCode {
+    use updater::config::{ApplyAction, HealthCheck, SourceConfig};
+
+    let Some(mut loaded) = load(args) else {
+        return ExitCode::FAILURE;
+    };
+
+    // Resolved before anything else so a typo'd path fails here, rather than as a
+    // confusing "no releases found" from the source layer three steps later.
+    let from = match from {
+        None => None,
+        Some(path) => match path.canonicalize() {
+            Ok(resolved) if resolved.is_dir() => Some(resolved),
+            Ok(resolved) => {
+                tracing::error!(path = %resolved.display(), "--from is not a directory");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "cannot read --from");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    let Some(cfg) = loaded.config.components.get_mut(component) else {
+        tracing::error!(
+            component,
+            known = ?loaded.config.components.keys().collect::<Vec<_>>(),
+            "no such component in the config"
+        );
+        return ExitCode::FAILURE;
+    };
+
+    // The guard that keeps the overrides below honest. Doing this through the store
+    // rather than the engine keeps it to the precise question — is a release *live* —
+    // so a half-finished install that left a directory but no symlink is still
+    // recoverable with this command.
+    let store = updater::store::Store::new(cfg.install_dir.clone());
+    match store.current() {
+        Ok(None) => {}
+        Ok(Some(live)) => {
+            tracing::error!(
+                component,
+                live = %live,
+                "refusing: this component already has a release live. `install` forces \
+                 on_apply and health off, which on a working robot would silently disable \
+                 auto-rollback. Use `robotctl update apply` — it goes through the daemon, \
+                 with the real health gate."
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            tracing::error!(component, error = %e, "cannot read the release store");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Logged, not silent. These overrides are the one way this command differs from an
+    // ordinary apply, so an operator reading the journal afterwards must be able to see
+    // that the health gate did not run, rather than infer it.
+    tracing::warn!(
+        component,
+        "bootstrap install: forcing on_apply=none, health=none — nothing is installed \
+         yet, so there is no unit to restart and no robotd to probe"
+    );
+    cfg.on_apply = ApplyAction::None;
+    cfg.health = HealthCheck::None;
+
+    match &from {
+        Some(path) => {
+            tracing::warn!(from = %path.display(), "installing from a local directory");
+            cfg.source = SourceConfig::LocalDir { path: path.clone() };
+        }
+        // Left as configured, which on a client robot is the network. Stated in the log
+        // because "which release did this robot start life on" is a support question, and
+        // the answer depends on which source answered.
+        None => tracing::info!(source = ?cfg.source, "installing from the configured source"),
+    }
+
+    let mut engine =
+        match updater::engine::Engine::new(loaded.config, loaded.keys, loaded.robot, loaded.faults)
+        {
+            Ok(engine) => engine,
+            Err(e) => {
+                tracing::error!(error = %e, "could not start the engine");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    // Progress is advisory and the channel unbounded, so this cannot slow the install
+    // down — it just makes a long download visible in the journal.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<updater::proto::Progress>();
+    tokio::spawn(async move {
+        while let Some(p) = rx.recv().await {
+            match p.percent {
+                Some(percent) => tracing::info!(phase = ?p.phase, percent, "installing"),
+                None => tracing::info!(phase = ?p.phase, "installing"),
+            }
+        }
+    });
+
+    let options = updater::engine::ApplyOptions {
+        dry_run,
+        // Nothing can be streaming from a robot with no release on it.
+        interrupt_sessions: false,
+    };
+
+    let result = engine
+        .apply(component, updater::proto::Target::Latest, options, tx)
+        .await;
+
+    use updater::proto::ApplyResult;
+    match result {
+        Ok(ApplyResult::Applied { to, .. }) => {
+            tracing::warn!(component, version = %to, "installed");
+            ExitCode::SUCCESS
+        }
+        Ok(ApplyResult::DryRunPassed { candidate }) => {
+            tracing::warn!(component, candidate = %candidate, "dry run passed, nothing installed");
+            ExitCode::SUCCESS
+        }
+        // Unreachable given the store guard above, but reporting it as success would be
+        // wrong if that guard ever moves.
+        Ok(ApplyResult::AlreadyCurrent { version }) => {
+            tracing::warn!(component, version = %version, "already current");
+            ExitCode::SUCCESS
+        }
+        // With health and on_apply off, a rollback means a hook inside the artifact
+        // failed. Worth naming, because the artifact — not the robot — is at fault.
+        Ok(ApplyResult::RolledBack {
+            attempted, reason, ..
+        }) => {
+            tracing::error!(
+                component,
+                attempted = %attempted,
+                reason,
+                "install was reverted; the release itself refused to install"
+            );
+            ExitCode::FAILURE
+        }
+        Ok(ApplyResult::Stuck { version, reason }) => {
+            tracing::error!(
+                component,
+                version = %version,
+                reason,
+                "install failed with nothing to revert to; this robot needs attention"
+            );
+            ExitCode::FAILURE
+        }
+        Err(updater::Error::Busy) => {
+            tracing::error!(
+                "another update holds the lock — updaterd is probably already running. \
+                 Stop it, or use `robotctl update apply`."
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            tracing::error!(component, error = %e, "install failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Recover, then serve the socket until told to stop. How systemd runs it.
+async fn serve(args: Args) -> ExitCode {
+    let Some(loaded) = load(&args) else {
+        return ExitCode::FAILURE;
+    };
+    let (config, keys, robot, faults) = (loaded.config, loaded.keys, loaded.robot, loaded.faults);
+
+    // Read before `config` is moved into the engine.
+    let config_check_interval = config.check_interval;
+    let config_auto_apply = config.auto_apply;
+    let allow_uids = config.allow_uids.clone();
+    let allow_gids = config.allow_gids.clone();
+
+    let mut engine = match updater::engine::Engine::new(config, keys, robot, faults) {
+        Ok(engine) => engine,
+        Err(e) => {
+            tracing::error!(error = %e, "could not start the engine");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // BEFORE serving. A robot that booted into a bad release has already begun
+    // reverting by the time anything can ask it to do something else.
+    match engine.recover_on_start().await {
+        Ok(outcomes) if outcomes.is_empty() => tracing::info!("nothing to recover"),
+        Ok(outcomes) => {
+            for outcome in &outcomes {
+                tracing::warn!(?outcome, "startup recovery");
+            }
+        }
+        Err(e) => {
+            // Not fatal: refusing to serve would remove the only way to fix it.
+            tracing::error!(error = %e, "startup recovery failed; serving anyway");
+        }
+    }
+
+    if args.check_only {
+        tracing::info!("--check-only: recovery done, not serving");
+        return ExitCode::SUCCESS;
+    }
+
+    let check_interval = config_check_interval;
+    let auto_apply = config_auto_apply;
+
+    let server = std::sync::Arc::new(updater::ipc::Server::with_policy(
+        engine, allow_uids, allow_gids,
+    ));
+    let socket = args.socket.clone();
+
+    // The scheduler is what makes `min_supported` effective: without it the floor is
+    // inert, because a robot only learns of it when someone opens the app.
+    match check_interval {
+        Some(interval) => {
+            // `auto_apply = all` restarts the robot on the updater's schedule rather than
+            // its owner's, so which policy is live belongs in the journal at a level that
+            // survives `RUST_LOG=warn` — it is the first thing to check when a robot
+            // restarted and nobody asked it to.
+            if auto_apply == updater::config::AutoApply::All {
+                tracing::warn!(
+                    interval_secs = interval.as_secs(),
+                    "auto_apply = all: this robot installs every available release without \
+                     waiting for a client. Intended for canary and bench robots."
+                );
+            } else {
+                tracing::info!(
+                    interval_secs = interval.as_secs(),
+                    ?auto_apply,
+                    "periodic update checks enabled"
+                );
+            }
+            server.spawn_periodic_checks(interval, auto_apply);
+        }
+        // Not just a missed convenience: with no timer, `auto_apply` is inert whatever it
+        // says, so a robot configured to update itself silently does not.
+        None if auto_apply != updater::config::AutoApply::Off => tracing::warn!(
+            ?auto_apply,
+            "auto_apply is set but there is no check_interval, so nothing will ever apply \
+             it unattended; a mandatory update will only be noticed when a client asks"
+        ),
+        None => tracing::warn!(
+            "periodic update checks are disabled (no check_interval); a mandatory update \
+             will only be noticed when a client asks"
+        ),
+    }
+
+    tokio::select! {
+        result = std::sync::Arc::clone(&server).serve(&socket) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "IPC server stopped");
+                return ExitCode::FAILURE;
+            }
+        }
+        _ = shutdown() => tracing::info!("shutting down"),
+    }
+
+    // Leaving a stale socket behind would make the next start log a warning for no
+    // reason.
+    let _ = std::fs::remove_file(&socket);
+    ExitCode::SUCCESS
+}
+
+/// Resolve on SIGTERM (systemd stop) or SIGINT (Ctrl-C).
+async fn shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot listen for SIGTERM");
+            return std::future::pending().await;
+        }
+    };
+    let mut int = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(_) => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::path::Path;
+
+    #[test]
+    fn args_definition_is_valid() {
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn faults_are_repeatable() {
+        let args = Args::try_parse_from([
+            "updaterd",
+            "--inject-fault",
+            "fail_health",
+            "--inject-fault",
+            "abort_after_swap",
+        ])
+        .unwrap();
+        assert_eq!(args.faults, ["fail_health", "abort_after_swap"]);
+    }
+
+    /// Defaults must be usable with no arguments at all — that is how systemd
+    /// starts it. No subcommand means serve.
+    #[test]
+    fn defaults_need_no_arguments() {
+        let args = Args::try_parse_from(["updaterd"]).unwrap();
+        assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG));
+        assert!(args.faults.is_empty());
+        assert!(!args.check_only);
+        assert!(
+            args.command.is_none(),
+            "a bare invocation must still mean serve"
+        );
+    }
+
+    #[test]
+    fn install_takes_a_directory_and_defaults_to_the_daemon_component() {
+        let args = Args::try_parse_from(["updaterd", "install", "--from", "/var/tmp/rel"]).unwrap();
+        let Some(Command::Install {
+            from,
+            component,
+            dry_run,
+        }) = args.command
+        else {
+            panic!("expected install, got {:?}", args.command);
+        };
+        assert_eq!(from.as_deref(), Some(Path::new("/var/tmp/rel")));
+        assert_eq!(component, "daemon");
+        assert!(!dry_run);
+    }
+
+    /// The one-liner installer's path: no `--from`, so the configured source resolves
+    /// `latest` itself and nothing has to parse a signed manifest in shell.
+    #[test]
+    fn install_without_from_uses_the_configured_source() {
+        let args = Args::try_parse_from(["updaterd", "install"]).unwrap();
+        let Some(Command::Install { from, .. }) = args.command else {
+            panic!("expected install, got {:?}", args.command);
+        };
+        assert!(from.is_none());
+    }
+
+    /// `--config` is global, so the bootstrap installer can point `install` at the same
+    /// config the daemon will use rather than at a copy of its values. A copy is what
+    /// would let the two disagree about `trusted_keys_dir` or `state_dir`.
+    #[test]
+    fn install_accepts_the_global_config_flag() {
+        let args = Args::try_parse_from([
+            "updaterd",
+            "install",
+            "--from",
+            "/var/tmp/rel",
+            "--config",
+            "/etc/robot/updater.toml",
+        ])
+        .unwrap();
+        assert_eq!(args.config, PathBuf::from("/etc/robot/updater.toml"));
+        assert!(matches!(args.command, Some(Command::Install { .. })));
+    }
+}

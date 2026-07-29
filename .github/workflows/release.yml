@@ -1,0 +1,238 @@
+# Publish a signed release to the STAGING channel.
+#
+# Triggered by a `daemon-staging-v*` tag. Staging is where every build lands; nothing
+# reaches client robots until it is promoted (see promote.yml and updater-design.md
+# §16.3). That split is the point: robots on `stable` are unaffected by a bad build,
+# and promotion ships the exact bytes staging validated.
+name: release
+
+on:
+  push:
+    tags: ['daemon-staging-v*']
+
+permissions:
+  contents: write   # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Releases are signed here, not locally — a deliberate choice. The signing key is
+    # therefore reachable from CI, so the job is gated behind an Environment: configure
+    # `release` in repo settings with required reviewers, and no run can reach the key
+    # without a second person approving it. Without that, anyone who can push a tag can
+    # sign for the whole fleet.
+    #
+    # Fork pull requests never receive secrets, so the key is unreachable from
+    # contributor PRs regardless.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the recorded revision is meaningful.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v1
+      - run: cargo install cargo-zigbuild --locked
+
+      - name: Derive version from the tag
+        id: version
+        run: |
+          # daemon-staging-v1.2.3 -> 1.2.3
+          version="${GITHUB_REF_NAME#daemon-staging-v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing $version from $GITHUB_REF_NAME"
+
+      # Same command and same glibc floor as scripts/board-test.sh, so what ships is
+      # what was tested rather than a differently-configured build.
+      #
+      # DUCK_REVISION and DUCK_BUILD_TIME are compiled into the binaries, so every daemon
+      # can state which commit it came from in its first log line and over IPC. Read at
+      # compile time because a shipped robot has no git repository. A build without them
+      # still works and reports "rev unknown" — which is exactly what a local build should
+      # say, and why they are not required.
+      - name: Build for the board
+        env:
+          DUCK_REVISION: ${{ github.sha }}
+        run: |
+          export DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cargo board --bins
+
+      - name: Package
+        run: |
+          mkdir -p staged
+          # Every daemon that ships in this artifact. robotd is not optional: `on_apply`
+          # restarts it, so an artifact without it would fail its own restart step and roll
+          # itself back.
+          cp target/aarch64-unknown-linux-gnu/release/updaterd staged/
+          cp target/aarch64-unknown-linux-gnu/release/robotctl staged/
+          cp target/aarch64-unknown-linux-gnu/release/robotd staged/
+
+          cargo run -p xtask -- package \
+            --version "${{ steps.version.outputs.version }}" \
+            --channel daemon \
+            --bin-dir staged \
+            --out dist \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}" \
+            --revision "${GITHUB_SHA}" \
+            --include "updater/systemd/updaterd.service=systemd/updaterd.service" \
+            --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
+            --include "robotd/systemd/robotd.service=systemd/robotd.service" \
+            --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
+            --include "docs/architecture.md=docs/architecture.md" \
+            --include "docs/updater-design.md=docs/updater-design.md" \
+            --include "deploy/README.md=docs/deploy.md"
+
+          # The bootstrap binary, published bare alongside the artifact.
+          #
+          # A fresh robot has no way to open a `.tar.zst`: extraction happens *inside*
+          # updaterd (tar + zstd are linked in), and the `zstd` binary is not on a stock
+          # Armbian image. So `scripts/install.sh` downloads this one file and runs
+          # `updaterd install --from <dir>` to land the first release through the real
+          # engine.
+          #
+          # Byte-identical to `bin/updaterd` inside the artifact, because it is the same
+          # file — which is what lets the installer verify it after the fact by comparing
+          # its sha256 against the copy that came out of the signature-verified tarball.
+          cp staged/updaterd "dist/updaterd-bootstrap-aarch64"
+
+      # Written to a file rather than passed as an argument: a key on a command line is
+      # visible in the process list to anything else on the runner.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/secret.key"
+          # MINISIGN_PASSWORD reaches xtask through clap's `env`, so an encrypted key
+          # needs no extra flag here.
+          cargo run -p xtask -- sign --dir dist --key "$RUNNER_TEMP/secret.key"
+          shred -u "$RUNNER_TEMP/secret.key" 2>/dev/null || rm -f "$RUNNER_TEMP/secret.key"
+
+      # Verify with the *robot's* own code path before publishing. If the updater
+      # cannot accept this release, nobody should be able to download it.
+      #
+      # Uses the sideload manifest `xtask package` already emitted and `xtask sign`
+      # already signed, so this step needs no access to the key. Re-signing here would
+      # mean handling the signing key twice in one job for no benefit.
+      - name: Verify the way a robot would
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          artifact="daemon-${version}.tar.zst"
+
+          mkdir -p verify/published verify/keys verify/opt verify/var
+          cp "dist/${version}.manifest.json"          verify/published/
+          cp "dist/${version}.manifest.json.minisig"  verify/published/
+          cp "dist/${artifact}"                       verify/published/
+          cp "dist/${artifact}.minisig"               verify/published/
+
+          # The public key is not a secret, but keeping it in CI config means the
+          # verification uses the same trust anchor a robot would.
+          printf '%s\n' "${{ vars.MINISIGN_PUBLIC_KEY }}" > verify/keys/release-1.pub
+
+          # The production `on_apply` and `health`, not inert placeholders. `updaterd
+          # install` overrides both for the duration of a bootstrap — see its doc comment
+          # — so this config also checks that those overrides are still in place. Writing
+          # `action = "none"` here would have tested nothing but the engine.
+          cat > verify/updater.toml <<EOF
+          trusted_keys_dir = "$PWD/verify/keys"
+          hw_rev = 1
+          state_dir = "$PWD/verify/var"
+
+          [component.daemon]
+          install_dir = "$PWD/verify/opt/daemon"
+          source = { type = "github_releases", repo = "${{ github.repository }}", tag_prefix = "daemon-v" }
+          on_apply = { action = "restart", units = ["robotd"] }
+          health = { probe = "socket", timeout = "30s" }
+          EOF
+
+          # The same command `scripts/install.sh` runs on a fresh robot, against the same
+          # files it would download. A host-native build, because the packaged binaries are
+          # aarch64 and this runner is x86_64 — what is under test is the bootstrap logic,
+          # not the cross-compile, which `scripts/board-test.sh` covers.
+          #
+          # Note this reaches `--from`, never the `github_releases` source above: an
+          # install that silently fell back to the network would be publishing a release
+          # by fetching some *other* release, and would pass while proving nothing.
+          cargo run -p updater --bin updaterd -- install \
+            --config verify/updater.toml \
+            --from verify/published
+
+          # Everything the robot needs must be present in the installed release, checked
+          # through the symlink the units actually resolve.
+          #
+          # `bin/robotd` is on this list because it was once missing: the release shipped
+          # only updaterd and robotctl while `on_apply` restarted robotd, so the first real
+          # release would have failed its own restart step and rolled itself back. An
+          # artifact that is missing a binary is indistinguishable from a good one until it
+          # is installed, which is exactly why this is asserted rather than assumed.
+          #
+          # Not executed, only checked: these are aarch64 binaries and the runner is x86_64.
+          # `scripts/board-test.sh` is what runs them.
+          for required in \
+            bin/updaterd \
+            bin/robotd \
+            bin/robotctl \
+            systemd/updaterd.service \
+            systemd/robotd.service \
+            systemd/sysusers.d/robot.conf \
+            deploy/journald.conf.d/10-robot.conf \
+            version.toml
+          do
+            if [ ! -e "verify/opt/daemon/current/$required" ]; then
+              echo "::error::release is missing $required"
+              exit 1
+            fi
+          done
+          test -x "verify/opt/daemon/current/bin/updaterd"
+          test -x "verify/opt/daemon/current/bin/robotd"
+
+          # The bootstrap asset must be the same bytes as the copy inside the artifact.
+          #
+          # This is what makes the installer's chain of trust close. The bootstrap binary
+          # is downloaded bare and run *before* anything has verified it, so on its own it
+          # is only as trustworthy as the TLS connection that fetched it. After the install
+          # the script compares its digest against `current/bin/updaterd`, which came out
+          # of a signature-verified tarball — equal digests mean the unverified binary was
+          # genuine. That check is worthless if the two are allowed to differ here.
+          boot_sum=$(sha256sum "dist/updaterd-bootstrap-aarch64" | cut -d' ' -f1)
+          installed_sum=$(sha256sum "verify/opt/daemon/current/bin/updaterd" | cut -d' ' -f1)
+          if [ "$boot_sum" != "$installed_sum" ]; then
+            echo "::error::updaterd-bootstrap-aarch64 does not match bin/updaterd in the artifact"
+            exit 1
+          fi
+          echo "bootstrap binary matches the artifact ($boot_sum)"
+
+          # The revision must have made it in, or support cannot tell two builds of the
+          # same version apart.
+          if ! grep -q "revision" "verify/opt/daemon/current/version.toml"; then
+            echo "::error::version.toml records no revision"
+            exit 1
+          fi
+          cat "verify/opt/daemon/current/version.toml"
+          echo "the updater accepted this release"
+
+      - name: Create the staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --prerelease \
+            --title "daemon ${{ steps.version.outputs.version }} (staging)" \
+            --notes "Staging build from \`${GITHUB_SHA}\`.
+
+          Not for client robots. Promote with the \`promote\` workflow once a canary
+          has run the on-device acceptance checks — promotion ships these exact bytes.
+          " \
+            dist/*

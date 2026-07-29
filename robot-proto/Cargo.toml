@@ -1,0 +1,17 @@
+[package]
+name = "robot-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IPC contracts between the robot's services and their clients"
+
+# Deliberately near-dependency-free. Every service and client speaks these types, so
+# anything added here is added to all of them — including `btd`, which must stay small
+# because it is part of the recovery path (architecture.md §1.1).
+#
+# In particular: no http, no tar, no crypto, no tokio. If a type needs one of those,
+# it belongs in the crate that owns the behaviour, not here.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
