@@ -38,7 +38,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `targets:` is not optional here — without it the aarch64 std is absent and the build
+      # fails at "can't find crate for `core`", which reads like a broken toolchain rather
+      # than a missing target. Same line as ci.yml's board job and release.yml.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - uses: mlugg/setup-zig@v2
         with:
