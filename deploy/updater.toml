@@ -82,6 +82,15 @@ type           = "github_releases"
 repo           = "ORG/duck-daemon"
 tag_prefix     = "daemon-v"
 manifest_asset = "manifest.json"
+# Tag prefix for per-branch dev builds, so `--ref my-branch` resolves to
+# `daemon-dev-my-branch`. Shown for completeness — this is the default.
+#
+# Separate from tag_prefix because the two streams must never be confusable: a dev tag
+# *moves* (it points at whatever that branch last built) while a release tag is immutable,
+# and `latest` for the fleet must never consider a dev tag. Installing one also requires
+# allow_dev_keys and the dev public key, so a client robot cannot take a branch build even
+# if it somehow resolved the tag.
+# ref_tag_prefix = "daemon-dev-"
 
 # `updaterd` restarts neither itself nor `btd`, both of which ship in this same artifact:
 # restarting itself would kill the executor mid-update, and restarting `btd` would drop

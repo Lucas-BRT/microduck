@@ -192,6 +192,15 @@ pub enum SourceConfig {
         /// Release asset holding the signed manifest.
         #[serde(default = "default_manifest_asset")]
         manifest_asset: String,
+        /// Tag prefix for per-branch dev builds, so `--ref my-branch` resolves to
+        /// `daemon-dev-my-branch`.
+        ///
+        /// Separate from `tag_prefix` because the two streams must not be confusable: a
+        /// dev tag *moves* (it points at whatever that branch built last) while a release
+        /// tag is immutable, and `newest_version` must never consider a dev tag when
+        /// resolving `latest` for the fleet.
+        #[serde(default = "default_ref_tag_prefix")]
+        ref_tag_prefix: String,
     },
     HfHub {
         /// `ORG/MODEL`.
@@ -205,6 +214,14 @@ pub enum SourceConfig {
     /// engine testable against the real code path with no network, and backs
     /// the dev sideload flow (`docs/updater-design.md` §16.1).
     LocalDir { path: PathBuf },
+}
+
+/// Default prefix for dev-build tags.
+///
+/// Names `daemon` because that is this robot's only source-backed component today; a robot
+/// with a differently-named channel sets it explicitly, the same as `tag_prefix`.
+fn default_ref_tag_prefix() -> String {
+    "daemon-dev-".to_owned()
 }
 
 fn default_manifest_asset() -> String {
@@ -445,8 +462,16 @@ mod tests {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("updater/ has a parent");
-        let workflow = std::fs::read_to_string(repo.join(".github/workflows/release.yml"))
-            .expect("release.yml must exist");
+        // Both workflows that build an artifact. A dev build missing `robotd` fails on the
+        // board in exactly the same way as a release missing it — `systemctl restart robotd`
+        // with no such unit — and a teammate hitting that would have no reason to suspect the
+        // packaging rather than their own branch.
+        let workflows = [".github/workflows/release.yml", ".github/workflows/dev.yml"].map(|w| {
+            (
+                w,
+                std::fs::read_to_string(repo.join(w)).unwrap_or_else(|_| panic!("{w} must exist")),
+            )
+        });
         let workspace = std::fs::read_to_string(repo.join("Cargo.toml")).unwrap();
 
         for unit in units {
@@ -468,17 +493,19 @@ mod tests {
                 unit_file.display()
             );
 
-            // ...and the release must ship both the binary and that unit file. Without
-            // these two lines the release installs successfully and then fails its own
-            // restart step.
-            assert!(
-                workflow.contains(&format!("release/{unit} staged/")),
-                "release.yml does not copy the `{unit}` binary into the artifact"
-            );
-            assert!(
-                workflow.contains(&format!("{unit}/systemd/{unit}.service=")),
-                "release.yml does not include `{unit}.service` in the artifact"
-            );
+            // ...and every workflow that builds an artifact must ship both the binary and
+            // that unit file. Without these two lines the release installs successfully and
+            // then fails its own restart step.
+            for (name, workflow) in &workflows {
+                assert!(
+                    workflow.contains(&format!("release/{unit} staged/")),
+                    "{name} does not copy the `{unit}` binary into the artifact"
+                );
+                assert!(
+                    workflow.contains(&format!("{unit}/systemd/{unit}.service=")),
+                    "{name} does not include `{unit}.service` in the artifact"
+                );
+            }
         }
     }
 

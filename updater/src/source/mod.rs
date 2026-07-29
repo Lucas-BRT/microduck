@@ -40,6 +40,19 @@ pub trait Source: Send + Sync {
     async fn manifest_for(&self, version: &semver::Version)
     -> Result<SignedBytes<Manifest>, Error>;
 
+    /// Fetch the manifest a named ref currently points at. Backs
+    /// `robotctl update apply --ref my-branch`.
+    ///
+    /// Defaulted rather than required because "a ref" is not meaningful for every source: a
+    /// local directory has no refs, and a source that cannot resolve one should say so
+    /// rather than guess. Sources that *can* override it.
+    async fn manifest_at_ref(&self, git_ref: &str) -> Result<SignedBytes<Manifest>, Error> {
+        Err(Error::Incompatible(format!(
+            "this source cannot resolve the ref {git_ref:?}; \
+             only a github_releases source publishes per-branch builds"
+        )))
+    }
+
     /// Download the artifact and its detached signature into `dest_dir`.
     ///
     /// Streams to disk — must not assume the artifact fits in memory — and is
@@ -78,10 +91,12 @@ pub fn from_config(config: &SourceConfig) -> Box<dyn Source> {
             repo,
             tag_prefix,
             manifest_asset,
+            ref_tag_prefix,
         } => Box::new(GithubReleases::new(
             repo.clone(),
             tag_prefix.clone(),
             manifest_asset.clone(),
+            ref_tag_prefix.clone(),
         )),
         SourceConfig::HfHub {
             repo,

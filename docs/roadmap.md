@@ -121,7 +121,7 @@ config store. Building it now would be carried-but-not-deliverable code. It land
 something actually reads it — `btd`'s wifi provisioning in M6, or `robotd`'s calibration
 in M4, whichever comes first.
 
-### M2 — Dev channel  ·  no hardware needed  ·  *unblocks the team*
+### M2 — Dev channel  ·  no hardware needed  ·  **code done, unverified on a board**
 
 Install a branch or commit on a board, over the air, without cutting a release.
 
@@ -148,8 +148,45 @@ What's actually new:
 - **A dev key**, distinct from the release key, in every developer board's trusted set —
   and *not* in a customer robot's.
 
+What landed:
+
+- ✅ **`Target::Ref(String)`**, `manifest_at_ref` on the source trait, and
+  `robotctl update apply daemon --ref my-branch`. `--ref` and `--version` conflict rather
+  than one silently winning. `API_VERSION` is 3.
+- ✅ **`dev.yml`** — every branch push cross-compiles, packages the same contents a release
+  ships, signs with `team.dev`, and replaces the prerelease at the moving tag
+  `daemon-dev-<branch>`.
+- ✅ **`xtask package` accepts a prerelease of the crate version** without
+  `--allow-version-drift`. Otherwise every branch build would need a flag documented as
+  "only for testing the tool itself", and it would stop catching what it exists for.
+- ✅ **Refs work on `local_dir` too**, which is what makes the whole path testable offline —
+  and is the sideload story. A ref becomes a filename there, so separators and `..` are
+  refused rather than sanitised.
+- ✅ The test that catches "the release forgot a binary" now checks **both** workflows: a dev
+  build missing `robotd` fails on the board identically, and a teammate hitting that would
+  blame their branch.
+
+Two properties worth restating because they are what makes this safe to run on every push:
+
+- A dev build **cannot become `latest`** — the version is a semver prerelease, so it sorts
+  below the release it precedes, and `version_from_tag` refuses to read a dev tag as a
+  release version. Tested from both directions.
+- A dev build **cannot install on a customer robot** — `allow_dev_keys = false` there, and a
+  trusted key only counts as a dev key if its filename ends `.dev.pub`. Two independent
+  conditions, neither of them a convention.
+
+A ref also has to bypass the downgrade guard, since a prerelease always sorts below the
+release a board is on — otherwise installing a branch onto an up-to-date board would be
+refused, which is every board people develop on. And a plain `apply` puts a dev board back
+on the release stream with no special command, because `latest` resolves to the highest
+*stable* version.
+
 **Done when:** a teammate pushes a branch, and I install it on a board with
 `robotctl update apply daemon --ref their-branch`, with rollback still working.
+
+**Not yet verified:** `dev.yml` has never run, and no board has installed by ref — the
+GitHub side of `manifest_at_ref` is exercised only by unit tests over the tag mapping, not
+against a real moving tag. That is the first thing to check once it publishes.
 
 ### M3 — `robotd` for real  ·  sim first
 

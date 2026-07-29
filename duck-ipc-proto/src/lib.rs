@@ -451,6 +451,17 @@ pub enum Target {
     Latest,
     /// An exact version — the primitive that makes release testing scriptable.
     Exact(semver::Version),
+    /// A named ref — a branch, in practice. The source maps it to a tag it can fetch.
+    ///
+    /// Exists so nobody has to type `0.2.0-dev.17.abc1234` to install a teammate's branch.
+    /// The version inside is still unique per build; this is a *pointer* to whichever build
+    /// that branch published last, which is why the tag it resolves to moves.
+    ///
+    /// Like [`Target::Exact`], this deliberately bypasses the downgrade guard: a dev build
+    /// is a semver prerelease and therefore sorts *below* the release it precedes, so every
+    /// install of one looks like a downgrade. Refusing them would make the flow useless,
+    /// and an operator naming a ref is stating intent as explicitly as naming a version.
+    Ref(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -982,6 +993,37 @@ mod tests {
     #[test]
     fn build_info_macro_reports_the_calling_crate() {
         assert_eq!(build_info!().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// `Target` must survive the wire in all three forms, and the two that carry data must
+    /// not be confusable. `latest` is a bare string while the others are single-key objects,
+    /// which is what an externally-tagged enum with `rename_all = "snake_case"` produces —
+    /// pinned here because this JSON is a contract with `btd` and the app, not an
+    /// implementation detail free to change when someone adjusts a derive.
+    #[test]
+    fn target_round_trips_in_every_form() {
+        let cases = [
+            (Target::Latest, r#""latest""#),
+            (
+                Target::Exact(semver::Version::new(1, 2, 3)),
+                r#"{"exact":"1.2.3"}"#,
+            ),
+            (Target::Ref("my-branch".into()), r#"{"ref":"my-branch"}"#),
+        ];
+        for (target, expected) in cases {
+            let line = serde_json::to_string(&target).unwrap();
+            assert_eq!(line, expected, "{target:?}");
+            assert_eq!(serde_json::from_str::<Target>(&line).unwrap(), target);
+        }
+    }
+
+    /// A branch name with slashes is a valid git ref and must survive verbatim. `feature/foo`
+    /// is the common case, and anything clever here would mangle it silently.
+    #[test]
+    fn a_ref_with_a_slash_survives_the_wire() {
+        let target = Target::Ref("feature/nested/name".into());
+        let line = serde_json::to_string(&target).unwrap();
+        assert_eq!(serde_json::from_str::<Target>(&line).unwrap(), target);
     }
 
     /// A local build reports no revision, and that must reach the wire as `null` rather

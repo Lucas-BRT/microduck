@@ -31,6 +31,7 @@ pub struct GithubReleases {
     repo: String,
     tag_prefix: String,
     manifest_asset: String,
+    ref_tag_prefix: String,
     client: reqwest::Client,
 }
 
@@ -54,10 +55,16 @@ struct Asset {
 }
 
 impl GithubReleases {
-    pub fn new(repo: String, tag_prefix: String, manifest_asset: String) -> Self {
+    pub fn new(
+        repo: String,
+        tag_prefix: String,
+        manifest_asset: String,
+        ref_tag_prefix: String,
+    ) -> Self {
         Self {
             repo,
             tag_prefix,
+            ref_tag_prefix,
             manifest_asset,
             // A failure here means a broken TLS setup, which is fatal for every
             // request anyway; fall back to a default client so construction stays
@@ -68,6 +75,15 @@ impl GithubReleases {
 
     fn tag_for(&self, version: &semver::Version) -> String {
         format!("{}{}", self.tag_prefix, version)
+    }
+
+    /// The tag a named ref resolves to: `daemon-dev-` + the branch name.
+    ///
+    /// The ref is appended verbatim. Branch names are already valid git refs, so slashes in
+    /// `feature/foo` need no handling — and rewriting them would resolve to a tag that does
+    /// not exist, failing with "release not found" instead of anything informative.
+    fn ref_tag_for(&self, git_ref: &str) -> String {
+        format!("{}{}", self.ref_tag_prefix, git_ref)
     }
 
     /// Parse a version out of a tag, or `None` if the tag isn't ours.
@@ -193,6 +209,12 @@ impl Source for GithubReleases {
         self.signed_manifest(&self.tag_for(version)).await
     }
 
+    async fn manifest_at_ref(&self, git_ref: &str) -> Result<SignedBytes<Manifest>, Error> {
+        let tag = self.ref_tag_for(git_ref);
+        tracing::debug!(repo = %self.repo, %tag, %git_ref, "resolving ref");
+        self.signed_manifest(&tag).await
+    }
+
     async fn fetch_artifact(
         &self,
         manifest: &Manifest,
@@ -264,6 +286,7 @@ mod tests {
             "ORG/robot-daemon".into(),
             "daemon-v".into(),
             "manifest.json".into(),
+            "daemon-dev-".into(),
         )
     }
 
@@ -273,6 +296,32 @@ mod tests {
         let v = semver::Version::new(1, 4, 2);
         assert_eq!(s.tag_for(&v), "daemon-v1.4.2");
         assert_eq!(s.version_from_tag("daemon-v1.4.2"), Some(v));
+    }
+
+    /// A ref becomes a dev tag, and the ref is appended verbatim.
+    ///
+    /// The slash case is the one that matters: `feature/foo` is a valid branch name, so
+    /// anything that sanitised it would resolve to a tag nobody published and fail with
+    /// "release not found" rather than anything that points at the cause.
+    #[test]
+    fn refs_become_dev_tags_verbatim() {
+        let s = source();
+        assert_eq!(s.ref_tag_for("my-branch"), "daemon-dev-my-branch");
+        assert_eq!(s.ref_tag_for("feature/foo"), "daemon-dev-feature/foo");
+    }
+
+    /// **A dev tag must never be mistaken for a release.** `version_from_tag` drives
+    /// `newest_version`, which is what the fleet installs — so if a dev tag parsed as a
+    /// version here, a branch build could become `latest` for every robot. That is the
+    /// failure the two independent guards exist to prevent, and this is the first of them.
+    #[test]
+    fn a_dev_tag_is_not_a_release_version() {
+        let s = source();
+        assert_eq!(s.version_from_tag("daemon-dev-my-branch"), None);
+        // Even when the dev tag ends in something version-shaped.
+        assert_eq!(s.version_from_tag("daemon-dev-0.2.0"), None);
+        // And the staging stream stays separate too.
+        assert_eq!(s.version_from_tag("daemon-staging-v0.2.0"), None);
     }
 
     /// Another channel's tags in the same repo must be ignored, not misparsed.

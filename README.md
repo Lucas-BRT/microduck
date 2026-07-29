@@ -119,10 +119,46 @@ Provisioning a board from scratch, and the log-retention caveats on Armbian, are
 
 ### Testing your branch on a board
 
-Not built yet. The design is `robotctl update apply daemon --ref my-branch`, with CI
-publishing a per-branch prerelease; that is M2 in the roadmap. Until then it is a manual
-cross-compile, sign and sideload — ask before doing it, because it needs a dev key in the
-board's trusted set.
+Push the branch. CI cross-compiles it, signs it with the team dev key, and publishes a
+prerelease at the moving tag `daemon-dev-<branch>`. Then, on the board:
+
+```bash
+sudo robotctl update apply daemon --ref my-branch
+```
+
+```bash
+robotctl version
+```
+
+```bash
+sudo robotctl update rollback daemon
+```
+
+No version numbers to copy: the tag moves to whatever that branch last built, while the
+version inside (`0.1.0-dev.42.c719ec8`) stays unique per build so two builds are never
+confusable. A plain `sudo robotctl update apply daemon` puts the board back on the release
+stream, because a prerelease sorts below its release — there is no "leave the dev channel"
+step.
+
+Nothing is relaxed for a dev build: same signature and hash verification, same health gate,
+same auto-rollback. The difference is the key, and that is what keeps these builds off
+customer robots — they refuse a dev key twice over (`allow_dev_keys = false`, and a trusted
+key only counts as a dev key if its filename ends `.dev.pub`).
+
+**A board has to opt in once**, which is also what stops this working on a robot that
+shouldn't take dev builds:
+
+```bash
+sudo cp team.dev.pub /etc/robot/trusted_keys/
+```
+
+```bash
+sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
+```
+
+```bash
+sudo systemctl restart updaterd
+```
 
 ## Releasing
 

@@ -342,6 +342,7 @@ impl Engine {
         let signed = match &target {
             crate::proto::Target::Latest => source.latest_manifest().await?,
             crate::proto::Target::Exact(v) => source.manifest_for(v).await?,
+            crate::proto::Target::Ref(git_ref) => source.manifest_at_ref(git_ref).await?,
         };
         self.verify_manifest(&signed)?;
         let manifest = signed.parsed.clone();
@@ -369,9 +370,11 @@ impl Engine {
         // backwards onto a version we withdrew — the classic downgrade attack on a
         // signed-artifact scheme.
         //
-        // Only `Latest` is guarded: `Exact` is a deliberate operator action (that is
-        // how a targeted revert works), and rollback/reset-to-golden move backwards
-        // on purpose without passing through here.
+        // Only `Latest` is guarded. `Exact` is a deliberate operator action (that is how a
+        // targeted revert works), and `Ref` *always* looks like a downgrade — a dev build is
+        // a semver prerelease, so it sorts below the release it precedes — so guarding it
+        // would reject every branch install. Rollback and reset-to-golden move backwards on
+        // purpose without passing through here.
         if matches!(target, crate::proto::Target::Latest)
             && let Some(installed) = &installed
             && manifest.version < *installed

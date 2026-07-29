@@ -132,6 +132,39 @@ impl Source for LocalDir {
         self.read_signed(&path)
     }
 
+    /// A ref names a manifest directly: `my-branch` → `my-branch.manifest.json`.
+    ///
+    /// Supported here, not just on the GitHub source, for two reasons: it makes the whole
+    /// `--ref` path testable through the real engine with no network, and it is the offline
+    /// sideload story — copy a directory onto a board and install by name.
+    ///
+    /// **The ref becomes a filename, so it is validated.** Unlike the GitHub source, where
+    /// `feature/foo` is a legitimate tag component, a separator here would escape the
+    /// directory — `../../etc/anything` is a path, not a branch. Rejected rather than
+    /// sanitised, because silently rewriting a caller's ref would install something other
+    /// than what they named.
+    async fn manifest_at_ref(&self, git_ref: &str) -> Result<SignedBytes<Manifest>, Error> {
+        if git_ref.is_empty()
+            || git_ref.contains('/')
+            || git_ref.contains('\\')
+            || git_ref.contains("..")
+        {
+            return Err(Error::Verification(format!(
+                "refusing ref {git_ref:?}: a local_dir ref becomes a filename, so it may not \
+                 contain a path separator or `..`"
+            )));
+        }
+
+        let path = self.root.join(format!("{git_ref}{MANIFEST_SUFFIX}"));
+        if !path.exists() {
+            return Err(Error::Network(format!(
+                "no manifest for ref {git_ref:?} in {}",
+                self.root.display()
+            )));
+        }
+        self.read_signed(&path)
+    }
+
     async fn fetch_artifact(
         &self,
         manifest: &Manifest,

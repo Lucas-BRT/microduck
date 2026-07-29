@@ -117,8 +117,20 @@ enum UpdateCommand {
 
         /// Exact version to install. Omit for whatever the source calls latest.
         /// This is the primitive that makes release testing scriptable.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "git_ref")]
         version: Option<semver::Version>,
+
+        /// Install what a branch last built, e.g. `--ref my-branch`.
+        ///
+        /// Resolves to the moving `daemon-dev-<ref>` tag CI publishes on every push, so the
+        /// exact version — `0.2.0-dev.17.abc1234` — never has to be typed. Dev builds are
+        /// signed with the team key, so a robot only accepts one if `allow_dev_keys` is on
+        /// and that key is in its trusted set: a customer robot refuses them.
+        ///
+        /// `conflicts_with` version rather than a silent precedence: asking for both a ref
+        /// and a version is a mistake worth reporting, not one to resolve by guessing.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "version")]
+        git_ref: Option<String>,
 
         /// Verify everything, then stop before the symlink swap.
         #[arg(long)]
@@ -681,13 +693,17 @@ fn run(cli: Cli) -> Result<(), Failure> {
         UpdateCommand::Apply {
             component: name,
             version,
+            git_ref,
             dry_run,
             interrupt_sessions,
         } => proto::Call::Apply(proto::ApplyParams {
             component: proto::ComponentId::new(name),
-            target: match version {
-                Some(version) => proto::Target::Exact(version.clone()),
-                None => proto::Target::Latest,
+            // clap enforces that version and git_ref are mutually exclusive, so the order
+            // here cannot silently prefer one over the other.
+            target: match (version, git_ref) {
+                (Some(version), _) => proto::Target::Exact(version.clone()),
+                (None, Some(git_ref)) => proto::Target::Ref(git_ref.clone()),
+                (None, None) => proto::Target::Latest,
             },
             options: proto::ApplyOptions {
                 dry_run: *dry_run,
@@ -866,6 +882,69 @@ mod tests {
             panic!("expected update apply");
         };
         assert_eq!(version, None);
+    }
+
+    /// `--ref` must reach the daemon as `Target::Ref`, not as anything else.
+    #[test]
+    fn apply_ref_becomes_a_ref_target() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "update",
+            "apply",
+            "daemon",
+            "--ref",
+            "my-branch",
+        ])
+        .expect("--ref must parse");
+        let Namespace::Update {
+            command: UpdateCommand::Apply {
+                git_ref, version, ..
+            },
+        } = cli.namespace
+        else {
+            panic!("expected update apply");
+        };
+        assert_eq!(git_ref.as_deref(), Some("my-branch"));
+        assert!(version.is_none());
+    }
+
+    /// A branch name with a slash must survive argument parsing untouched.
+    #[test]
+    fn apply_ref_accepts_a_slash() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "update",
+            "apply",
+            "daemon",
+            "--ref",
+            "feature/foo",
+        ])
+        .expect("a slashed ref must parse");
+        let Namespace::Update {
+            command: UpdateCommand::Apply { git_ref, .. },
+        } = cli.namespace
+        else {
+            panic!("expected update apply");
+        };
+        assert_eq!(git_ref.as_deref(), Some("feature/foo"));
+    }
+
+    /// Asking for a ref *and* a version is a mistake, and must be reported rather than
+    /// resolved by preferring one — the caller would otherwise get a build they did not ask
+    /// for and no indication of why.
+    #[test]
+    fn apply_refuses_both_ref_and_version() {
+        let result = Cli::try_parse_from([
+            "robotctl",
+            "update",
+            "apply",
+            "daemon",
+            "--ref",
+            "b",
+            "--version",
+            "1.0.0",
+        ]);
+        assert!(result.is_err(), "--ref with --version must be rejected");
     }
 
     // ── version reporting ────────────────────────────────────────────────────

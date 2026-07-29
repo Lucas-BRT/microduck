@@ -263,9 +263,24 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
     // robot reports a version that doesn't match what it's running.
     if !args.allow_version_drift {
         let crate_version = workspace_version()?;
-        if crate_version != args.version {
+        // A dev build is the crate version plus a prerelease tag — `0.2.0-dev.17.abc1234`
+        // against a crate at `0.2.0` — so its release triple must match while its prerelease
+        // component is free. Accepted without `--allow-version-drift` because every branch
+        // build would otherwise need the escape hatch, and a flag documented as "only for
+        // testing the tool itself" would become part of the normal path, where it would stop
+        // catching the mistake it exists for: tagging a release without bumping Cargo.toml.
+        let same_release = (args.version.major, args.version.minor, args.version.patch)
+            == (
+                crate_version.major,
+                crate_version.minor,
+                crate_version.patch,
+            );
+        let is_prerelease_of_it = same_release && !args.version.pre.is_empty();
+
+        if crate_version != args.version && !is_prerelease_of_it {
             return Err(format!(
                 "--version {} does not match the workspace version {crate_version}.\n\
+                 A prerelease of it ({crate_version}-dev.<run>.<sha>) is accepted.\n\
                  Bump Cargo.toml, or pass --allow-version-drift if this is deliberate.",
                 args.version
             )

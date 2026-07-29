@@ -249,6 +249,26 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Point a ref at an already-published version, the way CI's moving `daemon-dev-<branch>`
+    /// tag does: same artifact, a second manifest reachable by name.
+    ///
+    /// Copies the signed manifest and its signature under `<ref>.manifest.json`, so the
+    /// bytes and the signature still correspond — a ref is a *pointer*, never a re-signing.
+    fn point_ref_at(&self, git_ref: &str, version: &str) {
+        for (from, to) in [
+            (
+                format!("{version}.manifest.json"),
+                format!("{git_ref}.manifest.json"),
+            ),
+            (
+                format!("{version}.manifest.json.minisig"),
+                format!("{git_ref}.manifest.json.minisig"),
+            ),
+        ] {
+            std::fs::copy(self.releases.join(from), self.releases.join(to)).unwrap();
+        }
+    }
+
     /// Remove a published release from the fake remote, so `latest` resolves to an
     /// older one — a stale or reverted mirror.
     fn unpublish(&self, version: &str) {
@@ -376,6 +396,18 @@ async fn apply_exact(engine: &mut Engine, version: &str) -> Result<ApplyResult, 
         .apply(
             "daemon",
             Target::Exact(semver::Version::parse(version).unwrap()),
+            ApplyOptions::default(),
+            tx,
+        )
+        .await
+}
+
+async fn apply_ref(engine: &mut Engine, git_ref: &str) -> Result<ApplyResult, updater::Error> {
+    let (tx, _rx) = progress_channel();
+    engine
+        .apply(
+            "daemon",
+            Target::Ref(git_ref.to_owned()),
             ApplyOptions::default(),
             tx,
         )
@@ -1709,4 +1741,117 @@ async fn rollback_still_works_after_a_failed_select() {
         Some(semver::Version::new(1, 1, 0)),
         "a RolledBack entry's `to` must name the version that failed"
     );
+}
+
+// ── installing by ref (the dev channel, `docs/roadmap.md` M2) ────────────────
+
+/// **A ref installs what that branch last built.**
+///
+/// The version is a semver prerelease, so it sorts *below* the release it precedes — which
+/// is the whole point (a dev build can never look like an upgrade for the fleet) and also
+/// why this needs the downgrade guard to stand aside. See the next test.
+#[tokio::test]
+async fn a_ref_installs_the_build_it_points_at() {
+    let fx = Fixture::new();
+    fx.publish("0.2.0-dev.5.abc1234", None);
+    fx.point_ref_at("my-branch", "0.2.0-dev.5.abc1234");
+
+    let mut engine = fx.engine_healthy();
+    let result = apply_ref(&mut engine, "my-branch").await.unwrap();
+
+    assert!(
+        matches!(result, ApplyResult::Applied { .. }),
+        "expected Applied, got {result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("0.2.0-dev.5.abc1234"));
+}
+
+/// **A ref must bypass the downgrade guard.**
+///
+/// A robot on 0.2.0 installing `0.2.0-dev.6.…` is moving *backwards* in semver terms, every
+/// single time — a prerelease sorts below its release. If the guard applied here, installing
+/// a teammate's branch onto any up-to-date board would be refused, and the dev channel would
+/// be unusable on exactly the boards people develop on.
+#[tokio::test]
+async fn a_ref_may_move_backwards_where_latest_may_not() {
+    let fx = Fixture::new();
+    fx.publish("0.2.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("0.2.0"));
+
+    // The branch build precedes 0.2.0 in semver order.
+    fx.publish("0.2.0-dev.6.def5678", None);
+    fx.point_ref_at("my-branch", "0.2.0-dev.6.def5678");
+
+    let result = apply_ref(&mut engine, "my-branch").await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::Applied { .. }),
+        "a ref must not be refused as a downgrade, got {result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("0.2.0-dev.6.def5678"));
+
+    // And a plain `apply` gets the board back onto the release stream, because `latest`
+    // resolves to the highest *stable* version and a prerelease sorts below its release.
+    // Worth pinning: it means a board carrying someone's branch is one ordinary update away
+    // from being a normal robot again, with no special "leave the dev channel" command — and
+    // that a dev build never becomes what the fleet sees as latest.
+    let back = apply_latest(&mut engine).await.unwrap();
+    assert!(
+        matches!(back, ApplyResult::Applied { .. }),
+        "latest should move a dev board back onto the release, got {back:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("0.2.0"));
+}
+
+/// A dev build still has to verify. Signing with the team key is a *different key*, never a
+/// relaxed check, so a tampered dev artifact is refused exactly like a tampered release.
+#[tokio::test]
+async fn a_ref_is_verified_like_anything_else() {
+    let fx = Fixture::new();
+    fx.publish("0.2.0-dev.7.aaaaaaa", None);
+    fx.point_ref_at("my-branch", "0.2.0-dev.7.aaaaaaa");
+    fx.tamper("0.2.0-dev.7.aaaaaaa");
+
+    let mut engine = fx.engine_healthy();
+    let err = apply_ref(&mut engine, "my-branch").await.unwrap_err();
+
+    assert!(
+        matches!(err, updater::Error::Verification(_)),
+        "expected a verification failure, got {err:?}"
+    );
+    assert!(fx.live_version().is_none(), "nothing may be installed");
+}
+
+/// An unknown ref must fail with something that names the ref, not with a generic error.
+#[tokio::test]
+async fn an_unknown_ref_says_which_ref() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+
+    let err = apply_ref(&mut engine, "no-such-branch").await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("no-such-branch"),
+        "the error must name the ref: {message}"
+    );
+}
+
+/// A ref that would escape the directory is refused. `local_dir` turns a ref into a
+/// filename, so this is a path-traversal guard, and it fails as a verification error rather
+/// than quietly reading something else.
+#[tokio::test]
+async fn a_ref_cannot_escape_the_source_directory() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+
+    for bad in ["../outside", "sub/dir", ".."] {
+        let err = apply_ref(&mut engine, bad).await.unwrap_err();
+        assert!(
+            matches!(err, updater::Error::Verification(_)),
+            "ref {bad:?} must be refused, got {err:?}"
+        );
+    }
 }
