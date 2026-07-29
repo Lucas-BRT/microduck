@@ -14,7 +14,7 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 ## Installing a robot from scratch
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/miniduck_daemon/main/scripts/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
 ```
 
 Needs `curl` and coreutils and nothing else — `tar` and `zstd` are linked into `updaterd`,

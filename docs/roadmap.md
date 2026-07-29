@@ -42,7 +42,7 @@ makes two things urgent that would otherwise have waited:
 1. **Dev-channel installs** — install a specific branch or commit on a board, without
    cutting a release. This is now ahead of `btd`: teammates will use `robotctl`, not the
    phone app.
-2. ~~**A repo and a dev signing key**~~ — **done.** `pollen-robotics/miniduck_daemon`
+2. ~~**A repo and a dev signing key**~~ — **done.** `pollen-robotics/microduck_daemon`
    (private), CI green on first fix; `team.dev` key generated. Still outstanding before a
    real release: the signing secrets and the `release` environment gate (`ci-setup.md`).
 

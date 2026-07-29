@@ -1,4 +1,4 @@
-# miniduck daemon
+# microduck daemon
 
 The software that runs on the robot, and the machinery that ships it there.
 
