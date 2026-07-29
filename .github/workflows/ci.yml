@@ -52,14 +52,26 @@ jobs:
 
       # The publish tooling must keep working, or a release can't be cut. Cheap to
       # assert here rather than discovering it at tag time.
+      # Packages every binary a release ships, not just one: this is the step that would
+      # have caught `release.yml` shipping no `robotd`, so it should assemble the same set.
+      #
+      # The bins are built explicitly. `cargo test` above does not leave `target/debug/
+      # robotctl` on disk — only binaries some test actually executes get emitted there —
+      # so the previous `cp` failed on the very first CI run.
       - name: xtask smoke test
         run: |
-          mkdir -p /tmp/bin && cp target/debug/robotctl /tmp/bin/
-          cargo run -p xtask -- package \
-            --version "$(cargo metadata --format-version 1 --no-deps \
-                          | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')" \
-            --bin-dir /tmp/bin --out /tmp/dist
+          cargo build --workspace --bins
+          mkdir -p /tmp/bin
+          cp target/debug/updaterd /tmp/bin/
+          cp target/debug/robotd /tmp/bin/
+          cp target/debug/robotctl /tmp/bin/
+          # Named package, not `packages[0]`: with --no-deps that array holds every
+          # workspace member in an unspecified order, so the old form read whichever
+          # sorted first and passed only because they all share one version today.
+          version="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "updater"))')"
+          cargo run -p xtask -- package --version "$version" --bin-dir /tmp/bin --out /tmp/dist
           test -f /tmp/dist/manifest.json
+          test -f "/tmp/dist/${version}.manifest.json"
 
   board:
     # The target is aarch64; this is the only job that proves the binaries run there.
@@ -71,7 +83,15 @@ jobs:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
-      - uses: mlugg/setup-zig@v1
+      # v2, and the zig version pinned. Two separate reasons:
+      #   - v1's mirror list 404s for current zig releases, which is how this first
+      #     surfaced — every mirror failed and the job never got a compiler.
+      #   - "latest" would let the glibc floor move under us between runs. The floor is
+      #     the whole point of building with zig (see .cargo/config.toml), so the
+      #     toolchain that sets it must be a fixed input.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
       - run: cargo install cargo-zigbuild --locked
 
       # arm64 containers on an x86_64 runner need emulation; on arm64 runners this is
