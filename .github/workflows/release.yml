@@ -19,11 +19,19 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Releases are signed here, not locally — a deliberate choice. The signing key is
-    # therefore reachable from CI, so the job is gated behind an Environment: configure
-    # `release` in repo settings with required reviewers, and no run can reach the key
-    # without a second person approving it. Without that, anyone who can push a tag can
-    # sign for the whole fleet.
+    # Signs with `release-1`, the key customer robots trust. `dev.yml` signs branch builds
+    # with `team.dev`, which a customer robot refuses — two keys so "any build" and "a
+    # release" are distinguishable by the robot, not by convention.
+    #
+    # ⚠ `environment: release` is NOT a gate here. On this plan (free, private repo) the
+    # environment cannot carry required reviewers or a deployment branch policy — both were
+    # attempted and refused, see docs/ci-setup.md — so anyone with push access can reach
+    # this key, by pushing a tag or by authoring a workflow that declares this environment.
+    # That was accepted deliberately while no robot is in the field.
+    #
+    # The declaration stays for two reasons: the release secrets are scoped to it, so a
+    # workflow that does not declare it cannot see them; and it is the hook that turns a
+    # real gate on with one settings change if the org ever moves to GitHub Team.
     #
     # Fork pull requests never receive secrets, so the key is unreachable from
     # contributor PRs regardless.
@@ -117,11 +125,26 @@ jobs:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
+          # Lengths, not values: a key length is not sensitive, and "is not set" could not
+          # distinguish an absent secret from a present-but-empty one — which is exactly how
+          # the first real run failed, after `gh secret set` was fed stdin through a wrapper
+          # that did not forward it. A secret can be written but empty, and it still lists.
+          echo "key length: ${#MINISIGN_SECRET_KEY}, password length: ${#MINISIGN_PASSWORD}"
           if [ -z "$MINISIGN_SECRET_KEY" ]; then
-            echo "::error::MINISIGN_SECRET_KEY is not set — refusing to publish unsigned artifacts"
+            echo "::error::MINISIGN_SECRET_KEY is empty or unset — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          # A minisign secret key is two lines: a comment and the base64 payload. One line
+          # means the newline was lost in transit, which fails later inside minisign with a
+          # parse error that says nothing about the cause.
+          if [ "$(printf '%s' "$MINISIGN_SECRET_KEY" | wc -l)" -lt 1 ]; then
+            echo "::error::MINISIGN_SECRET_KEY looks like a single line — its newline was lost"
             exit 1
           fi
           umask 077
+          # '%s', not '%s\n': the key file ends with a newline, so the stored secret already
+          # contains it. Adding another would leave a trailing blank line nobody has tested
+          # minisign against.
           printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/secret.key"
           # MINISIGN_PASSWORD reaches xtask through clap's `env`, so an encrypted key
           # needs no extra flag here.

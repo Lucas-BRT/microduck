@@ -30,9 +30,12 @@ env:
 jobs:
   promote:
     runs-on: ubuntu-latest
-    # Same gate as release.yml: this job signs, so reaching the key needs approval.
-    # Promotion is the step that exposes robots to a build, so it warrants at least as
-    # much ceremony as publishing one.
+    # Signs with `release-1`. Promotion is the step that actually exposes customer robots
+    # to a build, so it is the most consequential thing in this repository.
+    #
+    # ⚠ `environment: release` is NOT a gate — see the same note in release.yml and
+    # docs/ci-setup.md. It scopes the secrets and is the hook for a real gate later; on this
+    # plan it stops no one who can push.
     environment: release
     steps:
       - uses: actions/checkout@v4
@@ -96,11 +99,26 @@ jobs:
           # clap's `env`. Without it, signing fails with "Key might be encrypted".
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
+          # Lengths, not values: a key length is not sensitive, and "is not set" could not
+          # distinguish an absent secret from a present-but-empty one — which is exactly how
+          # the first real run failed, after `gh secret set` was fed stdin through a wrapper
+          # that did not forward it. A secret can be written but empty, and it still lists.
+          echo "key length: ${#MINISIGN_SECRET_KEY}, password length: ${#MINISIGN_PASSWORD}"
           if [ -z "$MINISIGN_SECRET_KEY" ]; then
-            echo "::error::MINISIGN_SECRET_KEY is not set — refusing to publish unsigned artifacts"
+            echo "::error::MINISIGN_SECRET_KEY is empty or unset — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          # A minisign secret key is two lines: a comment and the base64 payload. One line
+          # means the newline was lost in transit, which fails later inside minisign with a
+          # parse error that says nothing about the cause.
+          if [ "$(printf '%s' "$MINISIGN_SECRET_KEY" | wc -l)" -lt 1 ]; then
+            echo "::error::MINISIGN_SECRET_KEY looks like a single line — its newline was lost"
             exit 1
           fi
           umask 077
+          # '%s', not '%s\n': the key file ends with a newline, so the stored secret already
+          # contains it. Adding another would leave a trailing blank line nobody has tested
+          # minisign against.
           printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/secret.key"
           cargo run -p xtask -- sign --dir dist --key "$RUNNER_TEMP/secret.key"
           shred -u "$RUNNER_TEMP/secret.key" 2>/dev/null || rm -f "$RUNNER_TEMP/secret.key"
