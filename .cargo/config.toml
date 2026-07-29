@@ -9,12 +9,15 @@
 # cross sysroot and — crucially — a C compiler for the one C dependency (`zstd`),
 # which plain cargo has no linker for on macOS.
 #
-# The `.2.31` suffix pins glibc (a cargo-zigbuild feature, not cargo syntax). Armbian
-# 26.2 ships three userlands for this board — Debian Bookworm (glibc 2.36), Ubuntu
-# Noble (2.39) and Debian Trixie (2.41) — so building below all of them means one
-# binary works whichever is flashed. Pinned rather than left to the host, because an
-# unpinned build links fine here and dies on the board; `scripts/board-test.sh`
-# asserts the resulting floor and runs the binary against all three.
+# The `.2.31` suffix pins glibc (a cargo-zigbuild feature, not cargo syntax). We ship
+# Debian 13 (Trixie), which has glibc 2.41, so the floor only needs to be at or below
+# that; 2.31 buys margin for nothing.
+#
+# What the pin actually defends against is the *build host*. Unpinned, the build links
+# against whatever glibc is on the machine or the CI runner, which is newer than the
+# board's — it links fine here and dies on the board, with nothing in the build output
+# to say why. `scripts/board-test.sh` asserts the resulting floor and runs the binaries
+# on the target userland.
 
 [alias]
 # Release build for the board. Add `--bins`, `-p updater --example playground`, etc.

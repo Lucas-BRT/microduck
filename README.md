@@ -62,18 +62,18 @@ to watch the boot counter undo a release that never confirmed healthy.
 | `btd` | BLE: wifi provisioning, naming, update trigger from the phone. **Not built yet.** |
 
 They talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
-`robot-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`
+`duck-ipc-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`
 never inherit the update engine's http/tar/crypto tree.
 
 ```
-robot-proto/   the wire contract
-updater/       engine + updaterd
-robotd/        control daemon
-robotctl/      the local CLI
-xtask/         package · sign · promote — build tooling, never shipped
-deploy/        what a robot is configured with: updater.toml, trust anchor, journald
-scripts/       install.sh (provisioning) · board-test.sh (aarch64 checks)
-docs/          architecture · update design · roadmap · CI setup
+duck-ipc-proto/ the wire contract
+updater/        engine + updaterd
+robotd/         control daemon
+robotctl/       the local CLI
+xtask/          package · sign · promote — build tooling, never shipped
+deploy/         what a robot is configured with: updater.toml, trust anchor, journald
+scripts/        install.sh (provisioning) · board-test.sh (aarch64 checks)
+docs/           architecture · update design · roadmap · CI setup
 ```
 
 ## Working on the robot
@@ -162,8 +162,7 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact
   refusal, boot-counter recovery, socket modes, peer-credential authorization — on
-  Debian Trixie, Ubuntu Noble *and* Debian Bookworm, the three userlands Armbian ships
-  for this board. Bookworm's glibc 2.36 is the lowest, so the pinned floor holds.
+  Debian 13 (Trixie), the userland we ship. `BOARD_IMAGES=` runs it against another.
 - **Never run on real hardware.** No board yet, so nothing here says anything about motor
   timing, control-loop jitter on a non-RT kernel, thermals or eMMC behaviour. Two specifics:
   `systemctl restart` in `on_apply` has never met real systemd (containers have none), and

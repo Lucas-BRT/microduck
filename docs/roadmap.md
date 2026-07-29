@@ -11,14 +11,14 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | | |
 |---|---|
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
-| `robot-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
+| `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
 | `robotd/` | heartbeat + the four `robot.*` methods, systemd unit — **skeleton done**; no control, no kinematics |
-| `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `robot-proto`, not `updater` |
+| `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, trust anchor, journald retention drop-in |
-| `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64 across Debian Trixie, Ubuntu Noble and Debian Bookworm (glibc 2.36, the floor) |
+| `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | tests | **229 passing**, including the health gate against a real `robotd` process |
 | missing | `mediad`, `btd`, `robot-config`, app, SDK, hardware |
 
@@ -64,7 +64,7 @@ to build on.
   and if answering needed the loop's lock, the one case where `updaterd` needs an answer
   is the case it would hang in. `--unhealthy` / `--busy` exercise rollback on a bench
   robot without breaking a real build.
-- ✅ **Extracted `robot-proto`.** `robotd` and `robotctl` depend on it; `robotctl` no
+- ✅ **Extracted `duck-ipc-proto`.** `robotd` and `robotctl` depend on it; `robotctl` no
   longer depends on `updater` at all, which was the point — a support tool on the
   recovery path should not link the update engine, and now structurally cannot reach
   into its internals instead of going through the socket.
@@ -91,7 +91,7 @@ Two things that test taught, worth keeping:
   silently tested a stale `robotd`. A sabotage check appeared to pass while proving
   nothing.
 - Sabotaging `robotd`'s health reply was caught **only** by these tests: all 190 others
-  passed, including `robot-proto`'s own round-trip test (both sides share the struct, so
+  passed, including `duck-ipc-proto`'s own round-trip test (both sides share the struct, so
   it cannot detect skew) and `robotd`'s unit tests (they called `state.health()` directly,
   bypassing dispatch). A `dispatch`-level unit test now closes that gap in microseconds;
   the process-level test stays, because it is the only thing covering the socket itself.
@@ -214,7 +214,7 @@ models version separately already.
 **Crate layout as it should end up:**
 
 ```
-robot-proto/    wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
+duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
                 on this, never on updater
 robot-config/   config store: file + flock + inotify        (not built yet)
 updater/        engine + updaterd

@@ -335,10 +335,15 @@ Build and verification: `scripts/board-test.sh` cross-compiles with `cargo-zigbu
 binaries on real ARM64 Linux in containers.
 
 The glibc floor is pinned at **2.31** (yielding an actual floor of 2.30) rather than
-Trixie's 2.41. Trixie is the target, but Armbian also offers Ubuntu Noble (2.39) and a
-minimal Bookworm (2.36) for this board, and building below all of them costs nothing
-while removing a way to get stranded on a reflash. The script runs the *same* binary
-against all three, Trixie first.
+Trixie's 2.41, and the script runs the binaries on **Trixie only** — the userland we ship.
+Armbian offers others for this board; testing configurations nobody runs costs job time to
+defend a claim we do not need, and `BOARD_IMAGES=` overrides it for a one-off check.
+
+The pin is not about those alternatives. It defends against the *build host*: unpinned, the
+build links against whatever glibc the developer's machine or the CI runner has, which is
+newer than the board's — it links cleanly and then fails to load on the robot, with nothing
+in the build output pointing at the cause. 2.31 is simply well below the target, which
+costs nothing.
 
 The kernel version is not a constraint: `flock`, `SO_PEERCRED` and `statvfs` all long
 predate 6.1.

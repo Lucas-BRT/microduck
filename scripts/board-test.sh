@@ -25,13 +25,20 @@ set -eu
 TARGET_DIR=target/aarch64-unknown-linux-gnu/release
 
 # Build floor. Below every Armbian 26.2 userland (Bookworm 2.36, Noble 2.39,
-# Trixie 2.41) so one binary serves all of them — and below Bullseye/Focal (2.31) too,
-# which costs nothing and removes a way to get stranded.
+# Trixie ships glibc 2.41, so the floor only has to be at or below that. It is pinned far
+# lower (2.31) because the risk is the *build host*, not the target: an unpinned build links
+# against whatever glibc the CI runner happens to have, and the day that moves above the
+# board's the binaries stop loading there — with nothing in the build to hint why.
 GLIBC_FLOOR=2.31
 
 
-# Trixie first: it is the target. The others are fallbacks Armbian also offers.
-IMAGES="debian:trixie-slim ubuntu:noble debian:bookworm-slim"
+# The target userland, and only that one. Armbian offers others for this board, but we
+# ship Debian 13 (Trixie), and testing configurations nobody runs costs ~2x the job time
+# to defend a claim we do not need. Adding one back is a word here if that changes.
+#
+# Overridable so a one-off check against another userland stays possible without editing
+# this file: BOARD_IMAGES="debian:bookworm-slim" ./scripts/board-test.sh
+IMAGES="${BOARD_IMAGES:-debian:trixie-slim}"
 
 # Checked up front: otherwise the build succeeds and the run fails several minutes
 # later with Docker's own error, which reads like a problem with the code.
