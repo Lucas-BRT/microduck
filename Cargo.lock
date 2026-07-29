@@ -1336,6 +1336,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
+ "test-support",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1795,6 +1796,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-support"
+version = "0.1.0"
+dependencies = [
+ "minisign",
+ "semver",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2091,6 +2105,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
+ "test-support",
  "thiserror",
  "tokio",
  "tokio-util",

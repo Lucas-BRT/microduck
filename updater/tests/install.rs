@@ -15,6 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use test_support::Publisher;
+
 /// A robot that has never been updated: published releases, trusted keys, an empty
 /// install tree, and a config carrying the **production** `on_apply` and `health`
 /// settings.
@@ -28,7 +30,7 @@ struct FreshRobot {
     root: PathBuf,
     published: PathBuf,
     install: PathBuf,
-    keypair: minisign::KeyPair,
+    publisher: Publisher,
 }
 
 impl FreshRobot {
@@ -37,29 +39,16 @@ impl FreshRobot {
         let root = dir.path().to_path_buf();
         let published = root.join("published");
         let install = root.join("opt/robot/daemon");
-        std::fs::create_dir_all(&published).unwrap();
-        std::fs::create_dir_all(root.join("keys")).unwrap();
         // Deliberately NOT creating `install`: a fresh robot has no install tree, and the
         // engine creating it is part of what this tests.
-
-        let keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
-        let public_key = keypair
-            .pk
-            .to_box()
-            .unwrap()
-            .to_string()
-            .lines()
-            .next_back()
-            .unwrap()
-            .to_owned();
-        std::fs::write(root.join("keys/release-1.pub"), &public_key).unwrap();
+        let publisher = Publisher::new(root.join("keys"), published.clone());
 
         let fresh = Self {
             _dir: dir,
             root,
             published,
             install,
-            keypair,
+            publisher,
         };
         fresh.write_config();
         fresh
@@ -133,73 +122,20 @@ path = "{}""#,
         std::fs::write(self.config_path(), rewritten).unwrap();
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        minisign::sign(None, &self.keypair.sk, data, None, None)
-            .unwrap()
-            .to_string()
-            .into_bytes()
-    }
-
-    /// Publish a signed release into the directory the installer would have downloaded
-    /// into, in the layout `updater::source::local` expects.
+    /// Publish a release containing the binaries a real one ships.
+    ///
+    /// Unlike the other suites, these tests assert the *binaries* landed — a swap onto an
+    /// empty directory would satisfy a symlink check and leave a robot with nothing to run.
     fn publish(&self, version: &str) {
-        let artifact_name = format!("daemon-{version}.tar.zst");
-        let artifact = self.published.join(&artifact_name);
-
-        let out = std::fs::File::create(&artifact).unwrap();
-        let enc = zstd::Encoder::new(out, 1).unwrap().auto_finish();
-        let mut builder = tar::Builder::new(enc);
-        // The binaries a real artifact carries, so the post-install assertions can check
-        // content landed rather than only that a symlink moved.
-        append(&mut builder, "bin/updaterd", b"#!updaterd", 0o755);
-        append(&mut builder, "bin/robotd", b"#!robotd", 0o755);
-        append(&mut builder, "bin/robotctl", b"#!robotctl", 0o755);
-        append(&mut builder, "systemd/updaterd.service", b"[Unit]\n", 0o644);
-        append(
-            &mut builder,
-            "version.toml",
-            format!("version = \"{version}\"\n").as_bytes(),
-            0o644,
-        );
-        builder.finish().unwrap();
-        drop(builder); // completes the zstd frame
-
-        let bytes = std::fs::read(&artifact).unwrap();
-        std::fs::write(
-            self.published.join(format!("{artifact_name}.minisig")),
-            self.sign(&bytes),
-        )
-        .unwrap();
-
-        let manifest = serde_json::json!({
-            "channel": "daemon",
-            "version": version,
-            "url": artifact_name,
-            "sha256": sha256_hex(&bytes),
-            "sig_url": format!("{artifact_name}.minisig"),
-            "size": bytes.len(),
-            "schema_version": 1,
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        std::fs::write(
-            self.published.join(format!("{version}.manifest.json")),
-            &manifest_bytes,
-        )
-        .unwrap();
-        std::fs::write(
-            self.published
-                .join(format!("{version}.manifest.json.minisig")),
-            self.sign(&manifest_bytes),
-        )
-        .unwrap();
+        let mut release = self.publisher.release(version);
+        for bin in ["bin/updaterd", "bin/robotd", "bin/robotctl"] {
+            release = release.file(bin, b"#!/bin/true\n", 0o755);
+        }
+        release.write();
     }
 
-    /// Corrupt a published artifact *after* signing — a tampered mirror.
     fn tamper(&self, version: &str) {
-        let path = self.published.join(format!("daemon-{version}.tar.zst"));
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0xff);
-        std::fs::write(&path, bytes).unwrap();
+        self.publisher.tamper("daemon", version);
     }
 
     fn install(&self, extra: &[&str]) -> Output {
@@ -230,7 +166,6 @@ path = "{}""#,
         cmd.output().unwrap()
     }
 
-    /// Version behind the `current` symlink, or `None` on a robot with nothing live.
     fn live(&self) -> Option<String> {
         std::fs::read_link(self.install.join("current"))
             .ok()
@@ -249,25 +184,6 @@ path = "{}""#,
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
-}
-
-fn append(builder: &mut tar::Builder<impl std::io::Write>, name: &str, body: &[u8], mode: u32) {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, name, body).unwrap();
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 // ── the bootstrap ────────────────────────────────────────────────────────────
@@ -474,7 +390,7 @@ fn missing_source_directory_is_reported_directly() {
 fn a_config_with_no_trusted_keys_is_fatal() {
     let fresh = FreshRobot::new();
     fresh.publish("1.0.0");
-    std::fs::remove_file(fresh.root.join("keys/release-1.pub")).unwrap();
+    std::fs::remove_file(fresh.publisher.key_file()).unwrap();
 
     let out = fresh.install(&[]);
     assert!(!out.status.success(), "{}", stderr(&out));

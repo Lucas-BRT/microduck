@@ -76,7 +76,6 @@ pub trait RobotClient: Send + Sync {
 
 /// Talks to `robotd` over its unix socket.
 pub struct SocketRobotClient {
-    #[allow(dead_code)]
     path: std::path::PathBuf,
 }
 

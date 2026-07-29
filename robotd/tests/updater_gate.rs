@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use test_support::Publisher;
 use updater::config::Config;
 use updater::engine::{ApplyOptions, Engine};
 use updater::faults::Faults;
@@ -110,105 +111,44 @@ impl Drop for Robotd {
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
-    releases: PathBuf,
     install: PathBuf,
-    keypair: minisign::KeyPair,
+    publisher: Publisher,
 }
 
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let releases = root.join("published");
         let install = root.join("opt/robot/daemon");
-        std::fs::create_dir_all(&releases).unwrap();
         std::fs::create_dir_all(&install).unwrap();
-        std::fs::create_dir_all(root.join("keys")).unwrap();
-
-        let keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
-        let public_key = keypair
-            .pk
-            .to_box()
-            .unwrap()
-            .to_string()
-            .lines()
-            .next_back()
-            .unwrap()
-            .to_owned();
-        std::fs::write(root.join("keys/prod.pub"), &public_key).unwrap();
+        let publisher = Publisher::new(root.join("keys"), root.join("published"));
 
         Self {
             _dir: dir,
             root,
-            releases,
             install,
-            keypair,
+            publisher,
         }
     }
 
     /// Where `robotd` should listen.
     ///
-    /// Under the tempdir so concurrent test binaries never collide. Unix socket paths cap
-    /// at ~104 bytes on macOS, which the short `d.sock` name keeps room for.
+    /// Under the tempdir so concurrent test binaries never collide. Unix socket paths cap at
+    /// ~104 bytes on macOS, which the short `d.sock` name keeps room for.
     fn socket(&self) -> PathBuf {
         self.root.join("d.sock")
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        minisign::sign(None, &self.keypair.sk, data, None, None)
-            .unwrap()
-            .to_string()
-            .into_bytes()
+    fn publish(&self, version: &str) {
+        self.publisher.publish(version);
     }
 
-    /// Publish a signed release into the fake remote directory.
-    fn publish(&self, version: &str) {
-        let artifact_name = format!("daemon-{version}.tar.zst");
-        let artifact = self.releases.join(&artifact_name);
+    fn live_version(&self) -> Option<String> {
+        test_support::live_version(&self.install)
+    }
 
-        let out = std::fs::File::create(&artifact).unwrap();
-        let enc = zstd::Encoder::new(out, 1).unwrap().auto_finish();
-        let mut builder = tar::Builder::new(enc);
-        let marker = format!("version={version}\n");
-        let mut header = tar::Header::new_gnu();
-        header.set_size(marker.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "version.toml", marker.as_bytes())
-            .unwrap();
-        builder.finish().unwrap();
-        drop(builder);
-
-        let bytes = std::fs::read(&artifact).unwrap();
-        std::fs::write(
-            self.releases.join(format!("{artifact_name}.minisig")),
-            self.sign(&bytes),
-        )
-        .unwrap();
-
-        let manifest = serde_json::json!({
-            "channel": "daemon",
-            "version": version,
-            "url": artifact_name,
-            "sha256": sha256_hex(&bytes),
-            "sig_url": format!("{artifact_name}.minisig"),
-            "size": bytes.len(),
-            "schema_version": 1,
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        std::fs::write(
-            self.releases.join(format!("{version}.manifest.json")),
-            &manifest_bytes,
-        )
-        .unwrap();
-        std::fs::write(
-            self.releases
-                .join(format!("{version}.manifest.json.minisig")),
-            self.sign(&manifest_bytes),
-        )
-        .unwrap();
+    fn live_marker(&self) -> Option<String> {
+        test_support::live_marker(&self.install)
     }
 
     /// An engine wired to a **real** `SocketRobotClient` — the point of this file.
@@ -233,7 +173,7 @@ health = {{ probe = "socket", timeout = "3s" }}
             state = self.root.join("var/lib/robot/updater").display(),
             socket = self.socket().display(),
             install = self.install.display(),
-            published = self.releases.display(),
+            published = self.publisher.releases.display(),
         ))
         .expect("fixture config must be valid");
 
@@ -244,15 +184,6 @@ health = {{ probe = "socket", timeout = "3s" }}
         let keys = KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys).unwrap();
         Engine::new(config, keys, robot, Faults::none()).unwrap()
     }
-
-    fn live_version(&self) -> Option<String> {
-        let target = std::fs::read_link(self.install.join("current")).ok()?;
-        Some(target.file_name()?.to_str()?.to_owned())
-    }
-
-    fn live_marker(&self) -> Option<String> {
-        std::fs::read_to_string(self.install.join("current/version.toml")).ok()
-    }
 }
 
 /// `apply` requires a progress sink; these tests do not assert on progress (`apply.rs`
@@ -262,17 +193,6 @@ async fn apply_latest(engine: &mut Engine) -> Result<ApplyResult, updater::Error
     engine
         .apply("daemon", Target::Latest, ApplyOptions::default(), tx)
         .await
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 // ── the wire ─────────────────────────────────────────────────────────────────

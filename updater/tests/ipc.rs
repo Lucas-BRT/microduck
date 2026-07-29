@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use test_support::Publisher;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use updater::config::{AutoApply, Config};
@@ -58,8 +59,7 @@ impl RobotClient for FakeRobot {
 struct Harness {
     _dir: tempfile::TempDir,
     root: PathBuf,
-    releases: PathBuf,
-    keypair: minisign::KeyPair,
+    publisher: Publisher,
     socket: PathBuf,
 }
 
@@ -67,117 +67,32 @@ impl Harness {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let releases = root.join("published");
-        for sub in [
-            "published",
-            "keys",
-            "opt/robot/daemon",
-            "var/lib/robot/updater",
-        ] {
-            std::fs::create_dir_all(root.join(sub)).unwrap();
-        }
+        std::fs::create_dir_all(root.join("opt/robot/daemon")).unwrap();
+        std::fs::create_dir_all(root.join("var/lib/robot/updater")).unwrap();
+        let publisher = Publisher::new(root.join("keys"), root.join("published"));
 
-        let keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
-        let public_key = keypair
-            .pk
-            .to_box()
-            .unwrap()
-            .to_string()
-            .lines()
-            .next_back()
-            .unwrap()
-            .to_owned();
-        std::fs::write(root.join("keys/prod.pub"), public_key).unwrap();
-
-        // Short path: unix socket paths are capped near 104 bytes on macOS, and a
-        // temp dir plus a long name can exceed it. Unique per harness, because every
-        // test in this binary shares one process — a pid-based name would collide.
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let socket =
-            std::env::temp_dir().join(format!("updaterd-t{}-{n}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket);
+        // Per-process socket path: several of these harnesses run concurrently, and a shared
+        // path makes them fight over the same socket.
+        let socket = root.join("updaterd.sock");
 
         Self {
             _dir: dir,
             root,
-            releases,
-            keypair,
+            publisher,
             socket,
         }
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        minisign::sign(None, &self.keypair.sk, data, None, None)
-            .unwrap()
-            .to_string()
-            .into_bytes()
+    /// Publish a signed release, optionally corrupting the artifact afterwards so the
+    /// signature no longer matches.
+    fn publish(&self, version: &str, tamper: bool) {
+        self.publish_with(version, tamper, |_| {});
     }
 
     fn publish_with(&self, version: &str, tamper: bool, edit: impl FnOnce(&mut serde_json::Value)) {
-        self.publish_inner(version, tamper, edit)
-    }
-
-    fn publish(&self, version: &str, tamper: bool) {
-        self.publish_inner(version, tamper, |_| {});
-    }
-
-    fn publish_inner(
-        &self,
-        version: &str,
-        tamper: bool,
-        edit: impl FnOnce(&mut serde_json::Value),
-    ) {
-        let artifact_name = format!("daemon-{version}.tar.zst");
-        let artifact = self.releases.join(&artifact_name);
-
-        let out = std::fs::File::create(&artifact).unwrap();
-        let enc = zstd::Encoder::new(out, 1).unwrap().auto_finish();
-        let mut builder = tar::Builder::new(enc);
-        let body = format!("version={version}\n");
-        let mut header = tar::Header::new_gnu();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "version.toml", body.as_bytes())
-            .unwrap();
-        builder.finish().unwrap();
-        drop(builder);
-
-        let bytes = std::fs::read(&artifact).unwrap();
-        std::fs::write(
-            self.releases.join(format!("{artifact_name}.minisig")),
-            self.sign(&bytes),
-        )
-        .unwrap();
-
-        let mut manifest = serde_json::json!({
-            "channel": "daemon",
-            "version": version,
-            "url": artifact_name,
-            "sha256": sha256_hex(&bytes),
-            "sig_url": format!("{artifact_name}.minisig"),
-            "size": bytes.len(),
-        });
-        edit(&mut manifest);
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        std::fs::write(
-            self.releases.join(format!("{version}.manifest.json")),
-            &manifest_bytes,
-        )
-        .unwrap();
-        std::fs::write(
-            self.releases
-                .join(format!("{version}.manifest.json.minisig")),
-            self.sign(&manifest_bytes),
-        )
-        .unwrap();
-
+        self.publisher.release(version).manifest(edit).write();
         if tamper {
-            let mut corrupted = std::fs::read(&artifact).unwrap();
-            corrupted.push(0xff);
-            std::fs::write(&artifact, corrupted).unwrap();
+            self.publisher.tamper("daemon", version);
         }
     }
 
@@ -214,7 +129,7 @@ health = {{ probe = "socket", timeout = "2s" }}
             keys = self.root.join("keys").display(),
             state = self.root.join("var/lib/robot/updater").display(),
             install = self.root.join("opt/robot/daemon").display(),
-            published = self.releases.display(),
+            published = self.publisher.releases.display(),
             extra = extra,
         ))
         .unwrap();
@@ -304,17 +219,6 @@ impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
 }
 
 /// Minimal JSON-RPC client over the socket.

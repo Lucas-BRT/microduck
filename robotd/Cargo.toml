@@ -36,6 +36,7 @@ libc = "0.2"
 # already.
 [dev-dependencies]
 updater = { path = "../updater" }
+test-support = { path = "../test-support" }
 minisign = "0.9.1"
 semver.workspace = true
 sha2 = "0.11.0"

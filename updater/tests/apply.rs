@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use test_support::Publisher;
+
 use updater::config::Config;
 use updater::engine::{ApplyOptions, Engine};
 use updater::faults::Faults;
@@ -91,10 +93,7 @@ struct Fixture {
     root: PathBuf,
     releases: PathBuf,
     install: PathBuf,
-    keypair: minisign::KeyPair,
-    /// Kept so a test can compare or restore the trusted key.
-    #[allow(dead_code)]
-    public_key: String,
+    publisher: Publisher,
 }
 
 impl Fixture {
@@ -103,199 +102,82 @@ impl Fixture {
         let root = dir.path().to_path_buf();
         let releases = root.join("published");
         let install = root.join("opt/robot/daemon");
-        std::fs::create_dir_all(&releases).unwrap();
         std::fs::create_dir_all(&install).unwrap();
-        // Created up front so a test can swap the trusted key before building an
-        // engine.
-        std::fs::create_dir_all(root.join("keys")).unwrap();
-
-        let keypair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
-        let public_key = keypair
-            .pk
-            .to_box()
-            .unwrap()
-            .to_string()
-            .lines()
-            .next_back()
-            .unwrap()
-            .to_owned();
-
-        std::fs::write(root.join("keys/prod.pub"), &public_key).unwrap();
+        let publisher = Publisher::new(root.join("keys"), releases.clone());
 
         Self {
             _dir: dir,
             root,
             releases,
             install,
-            keypair,
-            public_key,
+            publisher,
         }
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        minisign::sign(None, &self.keypair.sk, data, None, None)
-            .unwrap()
-            .to_string()
-            .into_bytes()
-    }
-
-    /// Publish a signed release into the fake "remote" directory.
-    ///
-    /// `hook` optionally embeds a `hooks/postinstall` script in the artifact.
     fn publish(&self, version: &str, hook: Option<&str>) {
-        self.publish_with(version, hook, |_| {});
+        let release = self.publisher.release(version);
+        match hook {
+            Some(script) => release.hook(script).write(),
+            None => release.write(),
+        }
     }
 
-    /// As [`Self::publish`], but lets the caller mutate the manifest before it is
-    /// signed — for compatibility and floor tests.
+    /// As [`Self::publish`], but lets the caller mutate the manifest before it is signed —
+    /// for compatibility and floor tests.
     fn publish_with(
         &self,
         version: &str,
         hook: Option<&str>,
         edit: impl FnOnce(&mut serde_json::Value),
     ) {
-        let artifact_name = format!("daemon-{version}.tar.zst");
-        let artifact = self.releases.join(&artifact_name);
-
-        // Build the .tar.zst.
-        let out = std::fs::File::create(&artifact).unwrap();
-        let enc = zstd::Encoder::new(out, 1).unwrap().auto_finish();
-        let mut builder = tar::Builder::new(enc);
-
-        let marker = format!("version={version}\n");
-        append(&mut builder, "version.toml", marker.as_bytes(), 0o644);
-        if let Some(script) = hook {
-            append(&mut builder, "hooks/postinstall", script.as_bytes(), 0o755);
+        let release = self.publisher.release(version).manifest(edit);
+        match hook {
+            Some(script) => release.hook(script).write(),
+            None => release.write(),
         }
-        builder.finish().unwrap();
-        drop(builder); // completes the zstd frame
-
-        let bytes = std::fs::read(&artifact).unwrap();
-        std::fs::write(
-            self.releases.join(format!("{artifact_name}.minisig")),
-            self.sign(&bytes),
-        )
-        .unwrap();
-
-        let mut manifest = serde_json::json!({
-            "channel": "daemon",
-            "version": version,
-            "url": artifact_name,
-            "sha256": sha256_hex(&bytes),
-            "sig_url": format!("{artifact_name}.minisig"),
-            "size": bytes.len(),
-            "schema_version": 1,
-        });
-        edit(&mut manifest);
-
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_path = self.releases.join(format!("{version}.manifest.json"));
-        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
-        std::fs::write(
-            self.releases
-                .join(format!("{version}.manifest.json.minisig")),
-            self.sign(&manifest_bytes),
-        )
-        .unwrap();
     }
 
-    /// Where model releases are published. Separate from the daemon's remote: one
-    /// shared directory would let the daemon's `latest` resolve to a model manifest.
+    /// Where model releases are published. Separate from the daemon's remote: one shared
+    /// directory would let the daemon's `latest` resolve to a model manifest.
     fn model_releases(&self) -> PathBuf {
         let dir = self.root.join("published-model");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// Publish a signed release on the `model` channel, for multi-component tests.
     fn publish_model(&self, version: &str) {
-        let releases = self.model_releases();
-        let artifact_name = format!("model-{version}.tar.zst");
-        let artifact = releases.join(&artifact_name);
-
-        let out = std::fs::File::create(&artifact).unwrap();
-        let enc = zstd::Encoder::new(out, 1).unwrap().auto_finish();
-        let mut builder = tar::Builder::new(enc);
-        append(&mut builder, "walk.onnx", b"weights", 0o644);
-        builder.finish().unwrap();
-        drop(builder);
-
-        let bytes = std::fs::read(&artifact).unwrap();
-        std::fs::write(
-            releases.join(format!("{artifact_name}.minisig")),
-            self.sign(&bytes),
-        )
-        .unwrap();
-
-        let manifest = serde_json::json!({
-            "channel": "model",
-            "version": version,
-            "url": artifact_name,
-            "sha256": sha256_hex(&bytes),
-            "sig_url": format!("{artifact_name}.minisig"),
-            "size": bytes.len(),
-            "schema_version": 1,
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        std::fs::write(
-            releases.join(format!("{version}.manifest.json")),
-            &manifest_bytes,
-        )
-        .unwrap();
-        std::fs::write(
-            releases.join(format!("{version}.manifest.json.minisig")),
-            self.sign(&manifest_bytes),
-        )
-        .unwrap();
+        self.publisher
+            .release(version)
+            .channel("model")
+            .dir(self.model_releases())
+            .file("walk.onnx", b"weights", 0o644)
+            .write();
     }
 
-    /// Point a ref at an already-published version, the way CI's moving `daemon-dev-<branch>`
-    /// tag does: same artifact, a second manifest reachable by name.
-    ///
-    /// Copies the signed manifest and its signature under `<ref>.manifest.json`, so the
-    /// bytes and the signature still correspond — a ref is a *pointer*, never a re-signing.
     fn point_ref_at(&self, git_ref: &str, version: &str) {
-        for (from, to) in [
-            (
-                format!("{version}.manifest.json"),
-                format!("{git_ref}.manifest.json"),
-            ),
-            (
-                format!("{version}.manifest.json.minisig"),
-                format!("{git_ref}.manifest.json.minisig"),
-            ),
-        ] {
-            std::fs::copy(self.releases.join(from), self.releases.join(to)).unwrap();
-        }
+        self.publisher.point_ref_at(git_ref, version);
     }
 
-    /// Remove a published release from the fake remote, so `latest` resolves to an
-    /// older one — a stale or reverted mirror.
     fn unpublish(&self, version: &str) {
-        for name in [
-            format!("{version}.manifest.json"),
-            format!("{version}.manifest.json.minisig"),
-            format!("daemon-{version}.tar.zst"),
-            format!("daemon-{version}.tar.zst.minisig"),
-        ] {
-            let _ = std::fs::remove_file(self.releases.join(name));
-        }
+        self.publisher.unpublish("daemon", version);
     }
 
-    /// Is a boot-counter trial outstanding?
+    fn tamper(&self, version: &str) {
+        self.publisher.tamper("daemon", version);
+    }
+
+    fn live_version(&self) -> Option<String> {
+        test_support::live_version(&self.install)
+    }
+
+    fn live_marker(&self) -> Option<String> {
+        test_support::live_marker(&self.install)
+    }
+
     fn pending_file_exists(&self) -> bool {
         self.root
             .join("var/lib/robot/updater/pending.json")
             .exists()
-    }
-
-    /// Corrupt a published artifact *after* signing, simulating a tampered mirror
-    /// or a truncated transfer.
-    fn tamper(&self, version: &str) {
-        let path = self.releases.join(format!("daemon-{version}.tar.zst"));
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.push(0xff);
-        std::fs::write(&path, bytes).unwrap();
     }
 
     /// Keys are written once at construction, never here — otherwise a test that
@@ -335,18 +217,6 @@ health = {{ probe = "socket", timeout = "2s" }}
         self.engine(Box::new(FakeRobot::healthy()), Faults::none(), "")
     }
 
-    /// Version the `current` symlink points at.
-    fn live_version(&self) -> Option<String> {
-        let target = std::fs::read_link(self.install.join("current")).ok()?;
-        Some(target.file_name()?.to_str()?.to_owned())
-    }
-
-    /// Reads the marker file through the symlink — proves the *content* switched,
-    /// not merely the link.
-    fn live_marker(&self) -> Option<String> {
-        std::fs::read_to_string(self.install.join("current/version.toml")).ok()
-    }
-
     fn release_exists(&self, version: &str) -> bool {
         self.install.join("releases").join(version).is_dir()
     }
@@ -362,24 +232,6 @@ health = {{ probe = "socket", timeout = "2s" }}
             })
             .unwrap_or(0)
     }
-}
-
-fn append(builder: &mut tar::Builder<impl std::io::Write>, name: &str, body: &[u8], mode: u32) {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, name, body).unwrap();
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    let digest = Sha256::digest(bytes);
-    digest.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// Drains progress so senders never block, and returns the phases seen.

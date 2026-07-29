@@ -61,10 +61,6 @@ struct Asset {
     /// serves the bytes with a token and `Accept: application/octet-stream`, and works for
     /// public repos too, so there is one path rather than two.
     url: String,
-    /// Kept for diagnostics and for the public-repo case where a manifest's `url` already
-    /// points here.
-    #[allow(dead_code)]
-    browser_download_url: String,
 }
 
 impl GithubReleases {
@@ -387,7 +383,6 @@ mod tests {
             assets: vec![Asset {
                 name: "other.txt".into(),
                 url: "https://api.github.com/repos/ORG/robot-daemon/releases/assets/1".into(),
-                browser_download_url: "https://example/other.txt".into(),
             }],
         };
         let err = GithubReleases::asset_url(&release, "manifest.json").unwrap_err();
