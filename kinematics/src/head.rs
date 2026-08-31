@@ -141,7 +141,7 @@ impl HeadFk {
             ];
             // cv2 camera axes: +x right, +y down, +z forward.
             let v = cam.quat.conjugate().rotate(v);
-            let flat = (v[0] * v[0] + v[2] * v[2]).sqrt();
+            let flat = v[0].hypot(v[2]);
             [v[0].atan2(v[2]), v[1].atan2(flat)]
         };
 

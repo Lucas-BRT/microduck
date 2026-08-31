@@ -183,7 +183,7 @@ impl Reprojector {
                 zones[i] = Zone::Floor { point };
                 continue;
             }
-            let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
+            let horizontal = r * dir_level[0].hypot(dir_level[1]);
             if horizontal < Self::MIN_RANGE_M {
                 zones[i] = Zone::TooClose;
                 continue;
