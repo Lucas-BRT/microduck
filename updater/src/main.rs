@@ -46,6 +46,15 @@ struct Args {
     #[arg(long, global = true)]
     robot_socket: Option<PathBuf>,
 
+    /// The account credential this robot signs in to, and the file `mediad` reads back.
+    ///
+    /// On a robot the default is right and nobody types it. It exists for the simulator, where the
+    /// daemons run as a person rather than as root and `/etc/robot` is not writable — see
+    /// `docs/robot/simulation.md`. `mediad --token` is the same flag on the reading side, and the
+    /// two must name one file or the duck signs in and never registers.
+    #[arg(long, global = true, default_value = updater::account::DEFAULT_PATH)]
+    token: PathBuf,
+
     /// Run boot recovery, then exit without serving.
     ///
     /// Note this **performs** recovery rather than reporting it: `record_boot` advances every armed
@@ -158,46 +167,46 @@ async fn robot_is_answering(robot: &dyn updater::robot::RobotClient) -> bool {
     )
 }
 
-/// A user name to a uid, and a group name to a gid.
+/// A user name to a uid, and a group name to a gid — with a line in the journal either way.
 ///
 /// `SO_PEERCRED` reports numbers, so a name has to become one somewhere. Doing it here, once at
 /// startup, is what lets `deploy/updater.toml` name `btd` and stay correct on a board where
 /// `systemd-sysusers` allocated a different uid.
 ///
-/// Duplicated in `configd`, deliberately: the obvious shared home would be `duck-ipc-proto`, and
-/// that crate is types only — every service speaks it, including the ones on the recovery path,
-/// so it may not grow a libc dependency for the convenience of two callers.
+/// The lookup itself is [`updater::unix`], which `account.rs` also uses for the token file's
+/// group. What is left here is the logging, and that is the part worth keeping local: these two
+/// lines are how you find out from the journal that a board's `allow_users` entry resolved to
+/// nothing, which looks exactly like a permissions bug from the client's end.
 fn resolve_uid(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // Safety: `getpwnam` takes a NUL-terminated string and returns a pointer into a static
-    // buffer, or null. Read immediately; nothing is retained.
-    let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if entry.is_null() {
-        tracing::warn!(
-            user = name,
-            "no such user; it cannot change this robot's software"
-        );
-        return None;
+    match updater::unix::user_id(name) {
+        None => {
+            tracing::warn!(
+                user = name,
+                "no such user; it cannot change this robot's software"
+            );
+            None
+        }
+        Some(uid) => {
+            tracing::info!(user = name, uid, "may change this robot's software");
+            Some(uid)
+        }
     }
-    let uid = unsafe { (*entry).pw_uid };
-    tracing::info!(user = name, uid, "may change this robot's software");
-    Some(uid)
 }
 
 fn resolve_gid(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // Safety: as above, for the group database.
-    let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
-    if entry.is_null() {
-        tracing::warn!(
-            group = name,
-            "no such group; it cannot change this robot's software"
-        );
-        return None;
+    match updater::unix::group_id(name) {
+        None => {
+            tracing::warn!(
+                group = name,
+                "no such group; it cannot change this robot's software"
+            );
+            None
+        }
+        Some(gid) => {
+            tracing::info!(group = name, gid, "may change this robot's software");
+            Some(gid)
+        }
     }
-    let gid = unsafe { (*entry).gr_gid };
-    tracing::info!(group = name, gid, "may change this robot's software");
-    Some(gid)
 }
 
 #[tokio::main]
@@ -606,10 +615,18 @@ async fn serve(args: Args) -> ExitCode {
     let check_interval = config_check_interval;
     let auto_apply = config_auto_apply;
 
-    let server = std::sync::Arc::new(updater::ipc::Server::with_policy(
-        engine, allow_uids, allow_gids,
+    let server = std::sync::Arc::new(updater::ipc::Server::with_policy_at(
+        engine,
+        allow_uids,
+        allow_gids,
+        args.token.clone(),
     ));
     let socket = args.socket.clone();
+
+    // Unconditional, unlike the update scheduler below: a Hugging Face token lasts thirty days
+    // and its refresh token rotates, so a robot that is on for a month loses remote access
+    // unless something renews it. `docs/design/remote-access-design.md` §2.7.
+    server.spawn_account_maintenance();
 
     // The scheduler is what makes `min_supported` effective: without it the floor is
     // inert, because a robot only learns of it when someone opens the app.
@@ -822,6 +839,9 @@ mod tests {
                 None
             }
             async fn remote_session_active(&self, _: std::time::Duration) -> bool {
+                false
+            }
+            async fn reload_policies(&self, _: std::time::Duration) -> bool {
                 false
             }
         }

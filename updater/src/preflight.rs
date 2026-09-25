@@ -91,7 +91,7 @@ pub struct Preflight<'a> {
 /// A board with no battery-backed RTC boots at the epoch (or at its image's build
 /// date), so this catches exactly the "never synced NTP yet" case without needing
 /// to talk to `timedatectl`.
-const CLOCK_FLOOR_UNIX: i64 = 1_735_689_600;
+pub(crate) const CLOCK_FLOOR_UNIX: i64 = 1_735_689_600;
 
 impl Preflight<'_> {
     /// Run every check and report all results.
@@ -259,6 +259,9 @@ mod tests {
         }
         async fn remote_session_active(&self, _t: Duration) -> bool {
             self.session
+        }
+        async fn reload_policies(&self, _timeout: Duration) -> bool {
+            true
         }
     }
 

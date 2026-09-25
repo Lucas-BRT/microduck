@@ -136,10 +136,22 @@ fn permits(call: &proto::Call) -> bool {
         // are permitted, including the two that change things.
         NetStatus => true,
         NetScan => true,
-        // Carries a wifi passphrase, which §7 requires to travel over a paired, encrypted link.
-        // It does: the characteristic sets `encrypt_authenticated_write` and the PIN agent makes
-        // the bond an authenticated one (`crate::pairing`). Routing this before that existed
-        // would have been the ordering mistake.
+        // Carries a wifi passphrase, and this arm used to claim that travels over a paired,
+        // authenticated link. It does not, and the claim was wrong in both halves.
+        //
+        // The characteristic sets `encrypt_write`, not `encrypt_authenticated_write`
+        // (`crate::bluez`) — and it sets it from `--require-pairing`, which is **off by default**,
+        // so on an ordinary board there is no encryption on this link at all. Nor could the
+        // stronger flag be satisfied if it were set: the agent leaves every handler `None`, which
+        // BlueZ publishes as `NoInputNoOutput`, so the bond is just-works and therefore encrypted
+        // but *unauthenticated*. `crate::pairing` records why a headless robot cannot do better,
+        // and `docs/design/app-path-design.md` §5.5 is the state of it.
+        //
+        // So what actually stands behind this route today is the PIN check in `crate::session` and
+        // the ten metres of radio range, and the passphrase crosses in clear. That is a known,
+        // accepted, pre-shipping cost — `btd` warns about it at every start — and §8.1 is the
+        // blocker that has to close before a robot goes to anyone. Routed anyway because a robot
+        // with no network cannot be given one any other way, which is what this transport is for.
         NetConnect(_) => true,
         NetForget(_) => true,
 
@@ -151,6 +163,25 @@ fn permits(call: &proto::Call) -> bool {
         // trigger an update should be able to show whether it took — and because the one daemon it
         // cannot report on this way is `btd` itself, which answering at all proves is running.
         SystemServices => true,
+
+        // The tail of one daemon's journal, and the next question after the line above: a unit
+        // reported as `failed` is a diagnosis nobody can act on without the reason it failed.
+        //
+        // Permitted because BLE is where the question is asked. A robot with no network cannot be
+        // reached by ssh, and that robot — one whose wifi never came up, whose `robotd` died on
+        // boot — is exactly the one whose journal somebody needs. Refusing here would mean the
+        // logs are readable over every transport except the one available when things are broken.
+        //
+        // Read-only, and bounded on the other side rather than trusted: `configd` picks the unit
+        // from a fixed list and refuses anything else, so this grants "the tail of a daemon this
+        // project ships", not `journalctl`. What a phone in the room learns is what that phone
+        // could already learn by watching the robot fail, in words it can put in a support ticket.
+        //
+        // The one thing worth naming as a cost: a journal line can carry more than a status. Ours
+        // are reviewed for that where it matters — `net.connect`'s passphrase is redacted by a
+        // hand-written `Debug` with a test pinning it (`proto::NetConnectParams`) — and this
+        // routing is the second reason that redaction is load-bearing rather than tidy.
+        SystemLogs(_) => true,
 
         // Rebooting is drastic but recoverable, and it is what an app offers when a robot is
         // confused — the alternative being "unplug it", which for a walking robot is worse.
@@ -197,13 +228,47 @@ fn permits(call: &proto::Call) -> bool {
         // `safeToRestart` would learn nothing it could act on.
         RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
 
-        // Motor control. **Never over BLE**, which is what §4.1 means by a subset: BLE is too
-        // slow and too constrained for the full surface, and teleop belongs on WebRTC's
-        // datachannel (`docs/design/remote-webrtc.md` §2). A 20-byte notification budget and a
-        // link that does not exist for the first ~73s of a boot is not a control transport. The
-        // skills, the body pose and the mouth are motor control like the rest.
-        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
-        | RobotMouth(_) => false,
+        // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
+        // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
+        // (`docs/design/remote-webrtc.md` §2). A 20-byte notification budget and a link that does
+        // not exist for the first ~73s of a boot is not a control transport. The body pose and
+        // the mouth ride with it: all of these are a stream of small updates, and the argument is
+        // about the stream, not about any one of them.
+        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_) => false,
+
+        // **Not teleop either, and it sat in that group for the same reason a skill did**: it was
+        // next to them in a match arm rather than because anybody argued it belonged. It is one
+        // request — start driving, or stop — not fifty a second, so the notification budget and
+        // the latency argument above do not reach it.
+        //
+        // What makes it necessary is what `robot.init` alone turned out not to do. Standing a
+        // robot up is the *first* of the two things the gamepad's Start button does; the second
+        // is this, and without it the app could stand a robot up and then be told by every skill
+        // it asked for that the policy is not driving — press Start on the pad. Half a path is
+        // worse than none, because it looks like the whole one until it stops.
+        //
+        // `toggle` rather than a state this side chose: `padd` keeps no belief about whether the
+        // policy is driving, for the reason its own comment gives — a local on/off drifts from
+        // the robot's the moment anything else moves it, and a stale belief turns the button into
+        // one that does nothing every other press. The robot owns the state and names the one it
+        // ended in, so a client shows the answer instead of predicting it.
+        RobotEnable(_) => true,
+
+        // **A skill is not teleop**, and it sat in that group for longer than it deserved. It is
+        // one request — "do the bow" — not fifty a second, so the notification budget and the
+        // latency argument above simply do not reach it. Nor does it need a control link at all:
+        // the deadman zeroes the twist by itself, so a robot with nothing driving it stands still
+        // and bows.
+        //
+        // What the refusals in this file mostly turn on is who is *watching*, and BLE answers
+        // that better than anything else here does — the radio reaches about ten metres, so a
+        // phone that can send this is in the room with the robot by construction. It is also the
+        // authenticated transport: the characteristic takes `encrypt_authenticated_write` and the
+        // bond is PIN-checked, which WebRTC has no equivalent of (`remote-webrtc.md` §4).
+        //
+        // Which skills a robot has is config, so a client asks `robot.policies` rather than
+        // assuming a list; an unknown name is refused with the names it does know.
+        RobotDo(_) => true,
 
         // Harmless and rather charming from a phone — but it rides the same refusal as the
         // rest of robot.* until the app path exists to want it: opening one call to the
@@ -234,11 +299,163 @@ fn permits(call: &proto::Call) -> bool {
         // made in the room, holding the pad, the same place `robot.shutdown` is refused for.
         RobotSetMode(_) => false,
 
-        // Power to the joints. A phone button that drops the robot on the floor is not one to
-        // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
-        // which wants the person doing it to be looking at the robot rather than at a screen. Both
-        // are `robotctl` on the robot, deliberately.
-        RobotInit | RobotRelax => false,
+        // Loading a policy is `robot.setMode` with a wider blast radius: it puts an arbitrary
+        // `.onnx` in charge of fifteen servos, and that file can come from a stranger on the Hub.
+        // Everything that makes it survivable — the shape gate, the clamps, the fall reflex — is
+        // unchanged whoever asked, so this was never about danger; it was that trying a gait
+        // means watching the robot try it, and there was no client that did.
+        //
+        // Both halves have since turned. There is a client, and BLE is the transport that best
+        // meets the watching condition: ten metres of radio range means whoever tapped it is
+        // looking at the robot, and the bond is PIN-authenticated. A load that fails keeps the
+        // controller that was running, so the failure mode is "nothing happened", not "gaitless
+        // robot on the floor".
+        //
+        // **This method persists.** `robotd` writes the slot key into `robotd.toml` before it
+        // queues the swap, so a gait chosen from a phone is the gait the robot boots into. It
+        // used to be `robotctl`'s half alone, which made the command and the method the same
+        // words with different durability depending on who asked — the ephemeral "try it until
+        // reboot" mode `policy-channel-design.md` §3 rejected, arrived at by accident.
+        //
+        // So this is a durable remote change, like `pad.bind` below, and belongs on the
+        // PIN-bonded transport for that reason as much as for the watching one. Undoing it is
+        // `robot.loadPolicy` with no path, which is reachable from the same phone.
+        RobotLoadPolicy(_) => true,
+
+        // Which button runs which skill, and changing one. **This is the transport those exist
+        // for**: `robotctl pad bind` is for whoever is holding the robot, and a phone that can
+        // already ask for a skill is the obvious place to decide which button asks for it.
+        //
+        // `pad.bind` writes the config file, and has to: `padd` re-reads `[pad]` every second,
+        // so a binding held in memory would be reverted before the caller let go of the phone.
+        //
+        // A name is checked against the skills this robot has before anything is written, so the
+        // failure mode is a refusal naming them rather than a button that does nothing.
+        PadBindings | PadBind(_) => true,
+
+        // The skill table: what this robot can be asked to do, and adding to it. The last thing
+        // in the policy path that only a terminal on the robot could reach — `[[policy.skill]]`
+        // is a repeating table, so `robotctl policy add` wrote it directly and there was nothing
+        // to route.
+        //
+        // `robotd` writes the file and reloads itself, so one call is the whole operation. A
+        // client that had to remember a second one and forgot would leave a robot whose config
+        // and behaviour disagree until the next restart.
+        RobotSkills | RobotSetSkill(_) | RobotRemoveSkill(_) => true,
+
+        // What each slot is running, and which skills this robot has. Read-only, and the read a
+        // client makes before it can offer either of the two above: there is no compiled-in list
+        // of skills to assume any more, so this is how a phone knows there is a bow to ask for.
+        RobotPolicies => true,
+
+        // Static geometry, read-only; the same class of read as the one above.
+        RobotModel => true,
+
+        // Re-reading the slots after something else edited the config. Same blast radius as
+        // `robot.loadPolicy` and the same answer, and a client that can load wants this for the
+        // case where the file changed underneath it.
+        RobotReloadPolicies => true,
+
+        // Is there a newer official policy set, and what else is on the Hub. Both reach the
+        // network, and neither changes anything on the robot — the same kind of question as
+        // `update.check`, which has been routed here since the update path was driven from a
+        // phone.
+        //
+        // They were refused on the grounds that answering "yes, there is a newer gait" for a
+        // client that could not then install one is an odd thing to offer. That was fair while it
+        // was true and stops being an argument the moment `policy.install` is routed, which is
+        // the next arm.
+        PolicyCheck | PolicySearch(_) => true,
+
+        // And installing one. This is the most obviously *appealing* thing in this file: a
+        // stranger's gait, from a phone, onto the robot in front of you.
+        //
+        // What makes it survivable is unchanged and was always the point — the manifest gate
+        // before the download, the shape gate at load, the joint clamps, the fall reflex — so
+        // this was never about danger. It was about who is *watching*, and BLE answers that
+        // better than anything else here: ten metres of radio range means whoever tapped it is
+        // looking at the robot, and the bond is PIN-checked.
+        //
+        // `policy.install` is `is_mutating`, so `updaterd` authorises it against the peer's
+        // uid — which is `btd`'s, not the phone's, exactly as it already is for `update.apply`.
+        // The transport is the gate here, not the credential.
+        PolicyFetch(_) | PolicyInstall(_) => true,
+
+        // The detector's set, by the same argument: a read that reaches the network, and an
+        // install whoever tapped it is standing next to.
+        DetectorCheck | DetectorInstall(_) => true,
+
+        // ── the account, which BLE is the right transport for ────────────────
+        //
+        // Signing the robot in to a Hugging Face account is what makes it reachable from outside
+        // the LAN at all, and this is the transport that should carry it — for the reason
+        // `remote-webrtc.md` §4 gives about BLE generally: it is PIN-bonded, and ten metres of
+        // radio range means whoever tapped the button is in the room with the robot.
+        //
+        // It also happens to be the *only* transport that can do it on a robot fresh out of a
+        // box. A duck with no wifi has no console to open and no LAN to open it from, and BLE is
+        // already how such a robot is given a network — so a wizard that joins the wifi and then
+        // signs the robot in is one flow on one transport, which is what the mini's app does.
+        //
+        // The code the flow produces has to be *read by a person*, so the reply carrying it is
+        // the point: this call sends about eighty bytes back, well inside what framing chunks,
+        // and needs no link at all while the user is off approving it — see
+        // `duck_ipc_proto::API_VERSION`'s v23 note on why `login` answers with a code and not
+        // with a token. That is what makes an iPhone dropping the GATT link mid-flow a
+        // non-event rather than a lost login.
+        AccountLogin(_) | AccountStatus | AccountLogout => true,
+
+        // **Standing the robot up, which is how anything else here starts.**
+        //
+        // Refused until the phone app was used, on the grounds that standing a robot up moves
+        // every joint at once and wants the person doing it to be looking at the robot rather
+        // than at a screen. The second half of that is the argument this file makes *for*
+        // routing things — ten metres of radio range means whoever tapped it is looking at the
+        // robot — and it is what lets `robot.do`, `robot.loadPolicy` and `policy.install`
+        // through. It was never a reason to refuse this one.
+        //
+        // What made it worth changing is what the refusal cost: a robot that has not been
+        // started ignores every other call this transport carries, so the app could show a
+        // robot's health, its wifi and its gaits and not make it move — and the way out was to
+        // go and find the gamepad. That is the opposite of what the app is for.
+        //
+        // `robotd` already publishes what a client needs to choose correctly: `homed` and
+        // `sitting` on `robot.policies`, added in API v30 and v31 for exactly this — a duck on
+        // its feet stands with `init`, a duck in its seat is held there by the `sit_toggle`
+        // latch and `init` argues with it rather than winning. A client that has those does not
+        // have to guess.
+        RobotInit => true,
+
+        // **The way back from a latched servo error, which is where a phone is the only tool.**
+        //
+        // It was refused beside `relax`, on the reading that cycling the servo bus while the
+        // robot is standing is the same fall by another route. That is true of the instruction
+        // and wrong about the situation: a servo that has latched overload, overheating or
+        // electrical shock is holding nothing already, and nothing else clears it but pulling
+        // the battery. So the call an owner needs is refused exactly when the robot is on the
+        // floor with a dead joint and there is nothing to fall.
+        //
+        // What made it worth changing is that no other way back reaches a phone. Standing up is
+        // `init`, routed above — and `init` on a robot with a latched servo does nothing but
+        // fail again, which is the state the app can now see (`robot.health` names the joint)
+        // and could not leave. The rest of the path is already here: torque goes off on every
+        // joint first, the servos come back limp with their gains restored on the next write,
+        // and `init` brings it up from there.
+        //
+        // The hazard is real for the robot that *is* standing, and it is the one the app is
+        // asked to state: this drops the joints, so have the robot down or hold it. That is the
+        // same claim `robot.do` and `robot.loadPolicy` are routed on — ten metres of radio range
+        // means whoever tapped it is looking at the robot.
+        RobotRebootMotors(_) => true,
+
+        // **`relax` stays refused, and the asymmetry is the point.** Standing up is controlled:
+        // the joints go where they are told. Relaxing is a robot that was holding itself up and
+        // now is not, which on a phone is a button whose failure mode is the floor, and its
+        // whole purpose is to produce that fall — unlike the reboot above, which exists to
+        // recover a robot that has already stopped holding itself. `init` has no such mode, and
+        // a refusal that covered all three was treating "moves the joints" as the hazard when
+        // the hazard is "stops holding them for nothing in return".
+        RobotRelax => false,
 
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
@@ -270,6 +487,8 @@ fn permits(call: &proto::Call) -> bool {
         // reason to see what the robot sees, it will be through `mediad`'s video path
         // (`architecture.md` §5.2), where depth belongs next to the frame it annotates.
         TofStream => false,
+        // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
+        HeadImuStream => false,
     }
 }
 
@@ -354,6 +573,23 @@ mod tests {
                 // neither call discards anything or downloads anything.
                 proto::method::ROLLBACK,
                 proto::method::SELECT,
+                // Replacing the policy set, and fetching a stranger's policy onto the board.
+                // Routed for the reason provisioning is: BLE's physical-presence claim (§4.2)
+                // holds — ten metres of radio range, a PIN-checked bond — and trying a gait is
+                // the thing that most wants whoever asked to be looking at the robot. Everything
+                // that makes it survivable is the same whoever asked: the manifest gate before
+                // the download, the shape gate at load, the clamps, the fall reflex.
+                proto::method::POLICY_INSTALL,
+                proto::method::POLICY_FETCH,
+                // Replacing the detector, by the same argument as the policy set.
+                proto::method::DETECTOR_INSTALL,
+                // Binding the robot to a Hugging Face account, and unbinding it. Provisioning,
+                // like the two below it and for the same reason: a robot out of a box has no
+                // network, so it has no console and no LAN to open one from, and this is the
+                // transport that reaches it. Physical presence is not stretched either — the
+                // person approving the code is holding the phone that is bonded to the robot.
+                proto::method::ACCOUNT_LOGIN,
+                proto::method::ACCOUNT_LOGOUT,
                 proto::method::NET_CONNECT,
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
@@ -477,6 +713,132 @@ mod tests {
         for (call, want) in expected {
             assert_eq!(upstream_for(&call), Some(want), "{}", call.method());
         }
+    }
+
+    /// **A phone can ask for a skill, see what the robot has, and change what it runs.**
+    ///
+    /// The three together, because none of them is much use alone: `robot.policies` is how a
+    /// client learns there is a bow to ask for — which skills exist is config, so there is no
+    /// list to compile in — and `robot.do` is the asking.
+    #[test]
+    fn a_phone_can_run_a_skill_and_change_a_policy() {
+        let expected = [
+            proto::Call::RobotPolicies,
+            proto::Call::RobotDo(proto::DoParams {
+                skill: "polite-bow".to_owned(),
+            }),
+            proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".to_owned()),
+                path: Some("/opt/robot/policies/current/alpha_walking.onnx".to_owned()),
+            }),
+            proto::Call::RobotReloadPolicies,
+            // The pair `robotctl pad bind` had no wire surface for at all.
+            proto::Call::PadBindings,
+            proto::Call::PadBind(proto::PadBindParams {
+                button: "x".to_owned(),
+                skill: Some("polite-bow".to_owned()),
+            }),
+            // The skill table — the last thing here only a terminal on the robot could reach.
+            proto::Call::RobotSkills,
+            proto::Call::RobotSetSkill(proto::SkillParams::default()),
+            proto::Call::RobotRemoveSkill(proto::SkillNameParams {
+                name: "polite-bow".to_owned(),
+            }),
+        ];
+        for call in expected {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Robot),
+                "{}",
+                call.method()
+            );
+        }
+    }
+
+    /// **A phone can get a robot back on its feet, and cannot put it on the floor.**
+    ///
+    /// The asymmetry in one test, because the two arms only make sense read together: `init`
+    /// stands it up, `rebootMotors` clears a latched servo error so that `init` can — and
+    /// `relax` stays refused, since its only outcome is a robot that was holding itself up and
+    /// now is not. Making that one reachable should have to delete a line here and say why.
+    #[test]
+    fn a_phone_can_recover_a_robot_but_not_drop_it() {
+        for call in [
+            proto::Call::RobotInit,
+            proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: vec![] }),
+            proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: vec![3, 11] }),
+        ] {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Robot),
+                "{}",
+                call.method()
+            );
+        }
+        assert_eq!(upstream_for(&proto::Call::RobotRelax), None);
+    }
+
+    /// **The Hub, from a phone.** What is out there, whether the official set has moved, and
+    /// installing one — the four that reach the network, all on `updaterd` beside `update.check`.
+    ///
+    /// `policy.install` and `policy.fetch` are mutating, so they are also named one by one in
+    /// [`only_these_mutating_calls_are_reachable_over_ble`]; this is the half that says they
+    /// arrive somewhere.
+    #[test]
+    fn a_phone_can_browse_and_install_from_the_hub() {
+        for call in [
+            proto::Call::PolicyCheck,
+            proto::Call::PolicySearch(proto::PolicySearchParams {
+                query: "microduck".to_owned(),
+            }),
+            proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+            proto::Call::DetectorCheck,
+            proto::Call::DetectorInstall(proto::PolicyInstallParams::default()),
+        ] {
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Updater),
+                "{}",
+                call.method()
+            );
+        }
+    }
+
+    /// **A skill is not teleop, and teleop is still refused.**
+    ///
+    /// `robot.do` spent a while grouped with these, and the distinction is the whole reason it
+    /// could be opened: one request against a stream of fifty a second. If somebody ever moves
+    /// `robot.move` into that arm by widening a pattern, this is what says no.
+    #[test]
+    fn teleop_stays_off_the_radio() {
+        for call in [
+            proto::Call::RobotMove(proto::MoveParams {
+                vx: 0.0,
+                vy: 0.0,
+                vyaw: 0.0,
+            }),
+            proto::Call::RobotHead(proto::HeadParams {
+                neck_pitch: 0.0,
+                head_pitch: 0.0,
+                head_yaw: 0.0,
+                head_roll: 0.0,
+            }),
+        ] {
+            assert_eq!(upstream_for(&call), None, "{}", call.method());
+        }
+    }
+
+    /// **Starting the policy is not teleop either**, and it left that arm for the same reason
+    /// `robot.do` did: one request, not a stream. It was pinned as refused here until the phone
+    /// app stood a robot up and found every skill answering "the policy is not driving — press
+    /// Start on the pad", which is the half-path `robot.init` alone leaves behind.
+    #[test]
+    fn starting_the_policy_is_reachable() {
+        let call = proto::Call::RobotEnable(proto::EnableParams {
+            on: false,
+            toggle: true,
+        });
+        assert!(upstream_for(&call).is_some(), "{}", call.method());
     }
 
     /// A refusal must be distinguishable from "no such method", because the two ask the user

@@ -66,6 +66,9 @@ impl RobotClient for DeadThenHealthy {
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 /// A robot that came up fine but cannot see its servos — a bench board with the motor
@@ -86,6 +89,52 @@ impl RobotClient for DegradedRobot {
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
+}
+
+/// A robot that is still coming up the first time it is asked, and fine after that.
+///
+/// What `robotd` answers between its socket opening and its first tick: `healthy: false`,
+/// `degraded: false`, reason "control loop has not completed a cycle yet". Its own comment on that
+/// line says the gate polls, so it will see the transition. This is the transition.
+struct StartingThenHealthy {
+    asked: std::sync::atomic::AtomicU32,
+}
+
+impl StartingThenHealthy {
+    fn new() -> Self {
+        Self {
+            asked: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RobotClient for StartingThenHealthy {
+    async fn safe_to_restart(&self, _t: std::time::Duration) -> SafeToRestart {
+        SafeToRestart::Yes
+    }
+    async fn health(&self, _t: std::time::Duration) -> Health {
+        let asked = self
+            .asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if asked == 0 {
+            Health::Unhealthy("control loop has not completed a cycle yet".into())
+        } else {
+            Health::Healthy
+        }
+    }
+    async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
+        Some(1)
+    }
+    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
+        false
+    }
+    async fn reload_policies(&self, _t: std::time::Duration) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -105,6 +154,9 @@ impl RobotClient for FakeRobot {
     }
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
+    }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
     }
 }
 
@@ -459,6 +511,114 @@ async fn check_reports_availability_without_changing_anything() {
         }
     ));
     assert_eq!(fx.live_version(), None, "check must not install anything");
+}
+
+/// When `daemon`'s source last answered, as `update.status` reports it.
+async fn last_checked(engine: &Engine) -> Option<i64> {
+    engine
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.component.to_string() == "daemon")?
+        .last_checked
+}
+
+/// How `daemon`'s last check went, as `update.status` reports it.
+async fn last_check_attempt(engine: &Engine) -> Option<updater::proto::CheckAttempt> {
+    engine
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.component.to_string() == "daemon")?
+        .last_check_attempt
+}
+
+/// **A check that reached the source says when, and one that did not says nothing.**
+///
+/// A robot that cannot reach its source reads exactly like one with nothing to install, so when
+/// the source last answered is what `update.status` has to carry. It must move only on an answer:
+/// a failed fetch recorded as a check would hide the one case this exists to show.
+#[tokio::test]
+async fn status_says_when_the_source_last_answered() {
+    let fx = Fixture::new();
+    let engine = fx.engine_healthy();
+
+    // Nothing checked yet: no answer, and no attempt either.
+    assert_eq!(last_check_attempt(&engine).await, None);
+
+    // Nothing published, so the fetch fails, and that is not an answer — but it is an attempt,
+    // and it says why.
+    let why = engine.check("daemon").await.unwrap_err().to_string();
+    assert_eq!(last_checked(&engine).await, None);
+    let attempt = last_check_attempt(&engine)
+        .await
+        .expect("a check that failed is recorded as an attempt");
+    assert_eq!(attempt.error.as_deref(), Some(why.as_str()));
+
+    fx.publish("1.0.0", None);
+    let before = updater::journal::now_unix();
+    engine.check("daemon").await.unwrap();
+    let at = last_checked(&engine)
+        .await
+        .expect("a check that reached the source is recorded");
+    assert!(at >= before, "{at} is before the check started at {before}");
+    assert_eq!(
+        last_check_attempt(&engine).await.unwrap().error,
+        None,
+        "an answer clears the failure before it"
+    );
+}
+
+/// **A check of a component this robot does not have is not an attempt.** The name arrives over
+/// IPC, and a typo must not add an entry for it.
+#[tokio::test]
+async fn a_check_of_an_unknown_component_records_nothing() {
+    let fx = Fixture::new();
+    let engine = fx.engine_healthy();
+    engine.check("nope").await.unwrap_err();
+    let attempts = fx.root.join("var/lib/robot/updater/check-attempts.json");
+    assert!(!attempts.exists(), "{}", attempts.display());
+}
+
+/// **A manifest that does not verify is not an answer either.** The fetch worked and the signature
+/// did not, and a source serving something unsigned has told this robot nothing.
+#[tokio::test]
+async fn a_manifest_that_does_not_verify_is_not_an_answer() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let manifest = fx.releases.join("1.0.0.manifest.json");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&manifest, bytes).unwrap();
+    let engine = fx.engine_healthy();
+
+    engine.check("daemon").await.unwrap_err();
+    assert_eq!(last_checked(&engine).await, None);
+}
+
+/// **A sideloaded release says nothing about the source.** `--from` reads a directory on the board,
+/// and counting it would report a source that has not answered in a month as fresh the day somebody
+/// pushed a dev build. An apply of the source's own latest does count.
+#[tokio::test]
+async fn applying_from_a_directory_is_not_an_answer_from_the_source() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    let mut engine = fx.engine_healthy();
+
+    apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert_eq!(last_checked(&engine).await, None);
+
+    fx.publish("2.0.0", None);
+    apply_latest(&mut engine).await.unwrap();
+    assert!(
+        last_checked(&engine).await.is_some(),
+        "an apply of the source's latest is an answer"
+    );
 }
 
 #[tokio::test]
@@ -937,6 +1097,19 @@ async fn crash_after_swap_is_reverted_when_the_robot_is_unhealthy() {
     assert_eq!(recovered.len(), 1, "should have reverted");
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
     assert_eq!(fx.live_marker().as_deref(), Some("version=1.0.0\n"));
+
+    // The revert must be journalled against the version that *failed*, so `known_bad`
+    // remembers 1.1.0 and leaves the release now running alone. An entry that named 1.0.0
+    // here blacklisted the good release and let 1.1.0 be retried forever.
+    let bad = engine.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 1, 0)),
+        "the failed release is what a RolledBack entry must name: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 0, 0)),
+        "the release reverted TO must not be blacklisted: {bad:?}"
+    );
 }
 
 /// **A release the robot is healthy on must not be reverted for want of a confirmation.**
@@ -974,6 +1147,50 @@ async fn an_unconfirmed_trial_on_a_healthy_robot_is_committed() {
         );
     }
     assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+}
+
+/// **A robot that is still starting is not a robot that failed.**
+///
+/// `robotd` answers "control loop has not completed a cycle yet" from the moment its socket opens
+/// until its first tick, and it says on that line that the gate polls and will see the transition.
+/// The apply gate does. Boot recovery asked once, with a two second timeout, and reverted on the
+/// answer. The two daemons start under different `After=` targets and nothing orders them, so on
+/// the boot that exhausts the budget the question could land in the seconds between `robotd`
+/// opening its socket and loading its policies, and a release the robot was about to be fine on
+/// went back to the previous one with "never reported healthy" in the log.
+#[tokio::test]
+async fn an_unconfirmed_trial_waits_for_a_robot_that_is_still_starting() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        "",
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    // First start counts. The second exhausts the budget and asks the robot, which is mid-start.
+    let mut engine = fx.engine(Box::new(StartingThenHealthy::new()), Faults::none(), "");
+    assert!(engine.recover_on_start().await.unwrap().is_empty());
+    let outcomes = engine.recover_on_start().await.unwrap();
+
+    assert!(
+        outcomes.is_empty(),
+        "a robot that had not ticked yet was treated as a failed release: {outcomes:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+    assert!(
+        !fx.pending_file_exists(),
+        "and once it answered healthy the trial is over"
+    );
 }
 
 /// And the case that prompted all of this: a bench board with no servo power.
@@ -1562,6 +1779,64 @@ async fn failed_transition_leaves_no_armed_trial() {
     assert!(engine.recover_on_start().await.unwrap().is_empty());
 }
 
+/// **#9** A `select` whose apply action failed *after* the swap returned early: the board
+/// stayed on the unverified release, the trial was disarmed, and nothing was journalled —
+/// while `apply` rolls back on the identical failure. Reachable in production by a unit
+/// that refuses to restart (`systemd-test.sh` reproduces one), which is what
+/// `fail_apply_action` stands in for.
+#[tokio::test]
+async fn a_failed_apply_action_on_select_rolls_back_and_is_journalled() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+    let keep = "keep_previous = 5";
+
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_exact(&mut engine, "1.1.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    // Select 1.0.0 back, with the unit restart failing after the symlink has moved.
+    let mut faulty = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            fail_apply_action: true,
+            ..Faults::none()
+        },
+        keep,
+    );
+    let outcome = faulty
+        .select("daemon", &semver::Version::new(1, 0, 0))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, ApplyResult::RolledBack { .. }),
+        "a failed apply action past the swap is a rollback, as in `apply`: {outcome:?}"
+    );
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "back on the release the board started from"
+    );
+    assert!(
+        !fx.pending_file_exists(),
+        "the revert disarms the trial, or the next boot reverts the revert"
+    );
+
+    // Journalled against the version that failed — the select's *target* — so it is
+    // known-bad and the release still running is not.
+    let bad = faulty.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 0, 0)),
+        "the select's target is what failed: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 1, 0)),
+        "the release reverted to must not be blacklisted: {bad:?}"
+    );
+}
+
 /// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process which
 /// release is golden and must not parse `updater.toml` to find out — a release whose `updaterd`
 /// rejects that file is the likeliest thing it exists to rescue. Every start publishes the answer
@@ -1639,8 +1914,14 @@ async fn starting_up_records_a_rescue_and_releases_its_guard() {
         .next()
         .expect("an entry in the update log");
     assert_eq!(entry.component.0, "daemon", "matched by install_dir");
-    assert_eq!(entry.from, Some(semver::Version::new(1, 1, 0)));
-    assert_eq!(entry.to, Some(semver::Version::new(1, 0, 0)));
+    // No `from`: it names the release the board was on *before* the failed one, which the
+    // crumb does not carry. Repeating the failed version here rendered `1.1.0 → 1.1.0` in
+    // `update log`, which reads as though nothing moved.
+    assert_eq!(entry.from, None);
+    // A RolledBack entry's `to` names the version that *failed* — the one the rescue moved
+    // off of — never the golden it landed on. Naming golden here blacklists the release the
+    // board is successfully running, via `known_bad`.
+    assert_eq!(entry.to, Some(semver::Version::new(1, 1, 0)));
     match entry.outcome {
         updater::proto::Outcome::RolledBack { reason } => assert!(
             reason.contains("robotd.service"),
@@ -1648,6 +1929,16 @@ async fn starting_up_records_a_rescue_and_releases_its_guard() {
         ),
         other => panic!("a rescue is a rollback, got {other:?}"),
     }
+
+    let bad = engine.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 1, 0)),
+        "the release the rescue moved off of is the one that failed: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 0, 0)),
+        "golden is what the board now runs; blacklisting it would block the next rollback: {bad:?}"
+    );
 }
 
 /// A rescue outranks an armed trial, and the order inside `recover_on_start` is what enforces it.
@@ -2636,4 +2927,49 @@ async fn a_degraded_commit_says_so_rather_than_reporting_healthy() {
     let detail = detail.expect("a pass that was not a clean bill of health must say why");
     assert!(detail.contains("motor bus"), "{detail}");
     assert!(detail.contains("cannot have caused"), "{detail}");
+}
+
+/// The same distinction, one route further out: what anyone asking for status is told.
+///
+/// The transcript learned to say "degraded" where it used to say "healthy"; `status` kept
+/// answering a three-way question with a boolean, so the board above -- a release the gate had
+/// just deliberately committed onto it -- was indistinguishable from a robot whose control loop
+/// was dead. `robotctl` printed `UNHEALTHY`, and a rollback with an unrelated cause was read as
+/// this robot's fault for an afternoon.
+#[tokio::test]
+async fn status_reports_a_degraded_robot_as_degraded() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine(Box::new(DegradedRobot), Faults::none(), "");
+    apply_latest(&mut engine).await.unwrap();
+
+    let status = engine.status().await.unwrap();
+    let daemon = &status[0];
+
+    assert_eq!(daemon.healthy, Some(false), "degraded is not healthy");
+    assert!(daemon.degraded, "and the fault belongs to the board");
+    assert!(
+        daemon
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("motor bus"),
+        "{:?}",
+        daemon.reason
+    );
+}
+
+/// And the healthy robot every other test in this file uses must stay unadorned: no `degraded`
+/// flag to explain away, and no reason string to read.
+#[tokio::test]
+async fn status_reports_a_healthy_robot_with_nothing_to_explain() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let engine = fx.engine_healthy();
+
+    let daemon = &engine.status().await.unwrap()[0];
+
+    assert_eq!(daemon.healthy, Some(true));
+    assert!(!daemon.degraded);
+    assert_eq!(daemon.reason, None);
 }

@@ -84,7 +84,7 @@ counter ([`updater-design.md`](updater-design.md)).
 | `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
-| `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console on `:8080`, signalling on `:8443` — no unix socket of its own | `robotd`, `configd`, `updaterd` |
+| `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
 | `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus |
 | `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |
 
@@ -353,8 +353,8 @@ absurdly have to go through BLE.
         ┌──────── one API definition (shared crate: types + operations)
         │
    ┌────┴─────┬────────────┬──────────────┬────────────────┐
-  BLE       unix socket   WebSocket     WebRTC datachannel
- (btd)      robotctl,     server-side   telepresence,
+  BLE       unix socket   rendezvous    WebRTC datachannel
+ (btd)      robotctl,     control lane  telepresence,
   subset    on-robot SDK  agents/LLM    full fidelity
 ```
 
@@ -411,16 +411,19 @@ For an LLM-driven controller, WebRTC is the *harder* path. An agent doesn't want
 30 fps H.264 track to decode — it wants a frame every second or two plus a state
 blob. Requiring ICE/DTLS/SDP and a decode pipeline first is a poor trade.
 
-| Consumer | Transport | Media |
+| Consumer | Control | Media |
 |---|---|---|
-| Telepresence (human) | WebRTC | tracks, low latency |
-| Server-side agent / LLM | **WebSocket** | `get_frame` → JPEG on demand, or 1–2 fps push |
+| Telepresence (human) | WebRTC datachannel | tracks, low latency |
+| Server-side agent / LLM | **rendezvous control lane** — JSON-RPC over HTTP/SSE, no WebRTC | WebRTC track; `media.stream` for a long-running program |
 | On-robot SDK, `robotctl` | unix socket | snapshot API |
 | App | BLE + WebRTC | as needed |
 
 Same API behind all of them. "Run an LLM on a server that controls the robot"
-becomes: open a WebSocket, poll a frame, send intents — a few dozen lines, no
-media stack. That is what makes it genuinely easy.
+becomes: sign in, send intents over the rendezvous, and take video only if it is
+wanted. The control lane reaches a robot from a data centre with no ICE, DTLS or
+TURN, which is what makes it genuinely easy;
+[`remote-access-design.md`](remote-access-design.md) §3.8 owns it, and
+[`faq.md`](../faq.md) says which media path to pick.
 
 Note also that LLM latency (hundreds of ms to seconds) means the agent is a
 **high-level** controller: "go to the kitchen", "look at the person". Reactive

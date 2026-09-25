@@ -409,8 +409,8 @@ impl Engine {
 
     // ── queries ──────────────────────────────────────────────────────────────
 
-    /// Is an update available? Changes nothing.
-    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+    /// [`Self::check`]'s answer, before it is recorded.
+    async fn check_source(&self, component: &str) -> Result<CheckResult, Error> {
         let cfg = self.config.component(component)?;
         let store = self.store(component)?;
         let installed = store.current()?;
@@ -464,19 +464,77 @@ impl Engine {
         }
     }
 
+    /// Is an update available? Changes nothing that is installed.
+    ///
+    /// Records that the source answered, when it did, because `update.status` reports how long ago
+    /// that was ([`crate::journal::Checked`]). Every `Ok` below comes after the manifest verified
+    /// and named this component's channel; an `Err` may be the fetch, the signature or the
+    /// channel, and none of those is an answer — so it is recorded as an attempt that failed, with
+    /// the reason `robotctl health` gives for the silence.
+    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+        let result = self.check_source(component).await;
+        match &result {
+            Ok(_) => self.source_answered(component),
+            // Only for a component this robot has: the name arrives over IPC, and an unknown one
+            // is a mistyped command rather than a check that failed.
+            Err(e) if self.config.component(component).is_ok() => {
+                self.source_did_not_answer(component, e);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// Note that `component`'s source answered with its latest. A failure to write that down is
+    /// logged and nothing more: it is a report about updates, not part of one.
+    fn source_answered(&self, component: &str) {
+        if let Err(e) = crate::journal::Checked::open(&self.config.state_dir).record(component) {
+            tracing::warn!(component, error = %e, "could not record that the update source answered");
+        }
+    }
+
+    fn source_did_not_answer(&self, component: &str, why: &Error) {
+        if let Err(e) = crate::journal::Checked::open(&self.config.state_dir)
+            .record_failure(component, &why.to_string())
+        {
+            tracing::warn!(component, error = %e, "could not record that a check of the update source failed");
+        }
+    }
+
     pub async fn status(&self) -> Result<Vec<ComponentStatus>, Error> {
         let mut out = Vec::new();
+        let checked = crate::journal::Checked::open(&self.config.state_dir);
         for (name, cfg) in &self.config.components {
             let store = Store::new(cfg.install_dir.clone());
-            let healthy = match cfg.health {
+            // The verdict, not a boolean summary of it: `healthy` alone cannot tell a board
+            // with no servo power — which the gate commits onto — from a dead control loop.
+            let report = match cfg.health {
                 HealthCheck::None => None,
                 // Only a socket probe means "ask robotd". A command probe is a
                 // different question entirely; reporting robotd's health for it would
                 // be plainly wrong, so run the probe we were configured with.
                 HealthCheck::Socket { .. } => {
-                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.is_healthy())
+                    Some(self.robot.health(ROBOT_QUERY_TIMEOUT).await.report())
                 }
-                HealthCheck::Command { .. } => Some(self.health_gate(cfg).await.is_ok()),
+                // An exec probe has no way to say "degraded": pass, or fail with what it
+                // printed. The error is the only reason anyone will get, so pass it on.
+                HealthCheck::Command { .. } => Some(match self.health_gate(cfg).await {
+                    Ok(GatePassed::Healthy) => crate::robot::HealthReport {
+                        healthy: true,
+                        degraded: false,
+                        reason: None,
+                    },
+                    Ok(GatePassed::Degraded(reason)) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: true,
+                        reason: Some(reason),
+                    },
+                    Err(e) => crate::robot::HealthReport {
+                        healthy: false,
+                        degraded: false,
+                        reason: Some(e.to_string()),
+                    },
+                }),
             };
             out.push(ComponentStatus {
                 component: ComponentId::new(name.clone()),
@@ -485,9 +543,13 @@ impl Engine {
                 // while an in-flight update holds it. A caller wanting live phase
                 // should subscribe to progress notifications instead.
                 phase: Phase::Idle,
-                healthy,
+                healthy: report.as_ref().map(|r| r.healthy),
+                degraded: report.as_ref().is_some_and(|r| r.degraded),
+                reason: report.and_then(|r| r.reason),
                 pinned: self.effective_pin(name),
                 last_attempt: self.journal.last_for(name)?,
+                last_checked: checked.get(name),
+                last_check_attempt: checked.last_attempt(name),
             });
         }
         Ok(out)
@@ -691,6 +753,13 @@ impl Engine {
         });
 
         Self::check_channel(&manifest, component)?;
+
+        // The source answered with its latest, signed and for this component: what a `check`
+        // records. Not a `--from` directory, which says nothing about the source, and not an exact
+        // version, which a source that has stopped moving still serves.
+        if options.from_dir.is_none() && matches!(target, crate::proto::Target::Latest) {
+            self.source_answered(component);
+        }
 
         if let Some(pinned) = self.effective_pin(component)
             && pinned != manifest.version
@@ -1120,6 +1189,9 @@ impl Engine {
         hook?;
 
         rec.phase(Phase::Applying, None);
+        if self.faults.fail_apply_action {
+            return Err(Error::Internal("injected apply-action failure".into()));
+        }
         self.run_apply_action(&cfg.on_apply, release_dir, rec)
             .await?;
 
@@ -1268,6 +1340,98 @@ impl Engine {
     }
 
     // ── explicit transitions ─────────────────────────────────────────────────
+
+    /// Install a policy set from the Hub and tell `robotd` to pick it up.
+    ///
+    /// Not an update in the component sense — no manifest, no signature, no health gate, no
+    /// rollback — and [`crate::policy`] says why. It is here because it needs this process's two
+    /// privileges, a network stack and root, and because `robotd` must be told afterwards: the
+    /// swap moves a symlink underneath unchanged paths, so nothing about the slots looks
+    /// different from the loop's side until something says otherwise.
+    ///
+    /// A robot that does not pick it up is reported rather than treated as a failure. The files
+    /// are installed and correct; the running loop is one restart behind, which is a true thing
+    /// to say and not a reason to undo a download.
+    pub async fn install_policies(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::POLICY_ROOT);
+        let (installed, previous) = crate::policy::install(root, version).await?;
+        let reloaded = match &previous {
+            // Nothing moved, so there is nothing for the robot to re-read and asking would only
+            // make it go home and rebuild for no reason.
+            None => true,
+            Some(_) => self.robot.reload_policies(ROBOT_QUERY_TIMEOUT).await,
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    ///
+    /// `mediad` loads the model once, at startup, so a swapped set is invisible to it until it
+    /// restarts — and unlike `robotd`'s policies there is no live reload to ask for, because the
+    /// detector is a thread holding an NPU context and the honest way to replace it is to start
+    /// again. The restart drops every video session, which is why `detector.install` is gated
+    /// like `policy.install`. `reloaded` is whether the restart took; a `mediad` this board does
+    /// not have (a bench) counts as taken, since there is nothing running the old one.
+    pub async fn install_detector(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::DETECTOR_ROOT);
+        let (installed, previous) = crate::policy::install_set(
+            root,
+            version,
+            crate::policy::Contents::Fixed(&crate::policy::DETECTOR_FILES),
+        )
+        .await?;
+        let reloaded = match &previous {
+            None => true,
+            Some(_) => match restart_one(SYSTEMCTL, MEDIAD_UNIT).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mediad did not restart onto the new detector");
+                    false
+                }
+            },
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
+    /// Fetch one policy from any Hub repo into this robot's library.
+    ///
+    /// The model API comes from the running `robotd` rather than from a constant here, because it
+    /// is the daemon that implements the contract and this process only carries it. An
+    /// unreachable robot is not a refusal — see [`crate::policy::Expectations::here`].
+    pub async fn fetch_policy(
+        &self,
+        repo: &str,
+        revision: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<crate::proto::PolicyFetchResult, Error> {
+        let model_api = self.robot.model_api(ROBOT_QUERY_TIMEOUT).await;
+        // What the robot is pointed at, so the prune that follows the fetch cannot take a gait
+        // out from under it. `None` — a robot that did not answer — prunes nothing at all.
+        let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
+        crate::policy::fetch(
+            &self.config.policy_library,
+            repo,
+            revision,
+            file,
+            crate::policy::Expectations::here(model_api),
+            in_use.as_deref(),
+        )
+        .await
+    }
 
     /// Revert to the previously installed release.
     ///
@@ -1437,20 +1601,28 @@ impl Engine {
             rec.finish(&failed);
             return failed;
         }
+        // The swap has already happened, so a failed apply action means what a failed gate
+        // means: the board is on the new release with its daemons not demonstrably running.
+        // Take the same revert-and-journal path as the gate, as `apply` does for everything
+        // past the swap. Returning early here disarmed the trial and left no log entry, so
+        // the board stayed on an unverified release with no boot-counter protection and no
+        // record of it.
         rec.phase(Phase::Applying, None);
-        if let Err(e) = self
-            .run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
-            .await
-        {
-            let _ = self.boot_counter.confirm(component);
-            let failed = Err(e);
-            rec.finish(&failed);
-            return failed;
-        }
-
-        rec.phase(Phase::HealthGate, None);
-        let gate = self.health_gate(cfg).await;
-        record_gate(rec, &gate);
+        let apply_action = if self.faults.fail_apply_action {
+            Err(Error::Internal("injected apply-action failure".into()))
+        } else {
+            self.run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
+                .await
+        };
+        let gate = match apply_action {
+            Ok(()) => {
+                rec.phase(Phase::HealthGate, None);
+                let gate = self.health_gate(cfg).await;
+                record_gate(rec, &gate);
+                gate.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
 
         let outcome = match gate {
             Ok(_) => {
@@ -1706,9 +1878,18 @@ impl Engine {
             //
             // Only for a socket gate. `HealthCheck::None` has nothing to ask, and `Command` answers
             // a two-way question — there is no "degraded" in an exit status.
-            if let HealthCheck::Socket { .. } = cfg.health {
-                match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                    crate::robot::Health::Healthy => {
+            if let HealthCheck::Socket { timeout, .. } = &cfg.health {
+                // For as long as the gate would have, and for the gate's reason: at boot this
+                // question lands while `robotd` may still be loading its policies, and the two
+                // units are not ordered. See `robot_verdict`.
+                //
+                // Recovery runs before the socket is served, so a `robotd` that never answers at
+                // all now holds `updaterd` off `/run/updaterd.sock` for this timeout rather than
+                // for `ROBOT_QUERY_TIMEOUT`. Only on the boot that reverts, and it buys the case
+                // above: a release the robot was about to be fine on, replaced under whoever is
+                // holding it.
+                match self.robot_verdict(*timeout).await {
+                    Some(crate::robot::Health::Healthy) => {
                         tracing::warn!(
                             component = %pending.component,
                             version = %pending.version,
@@ -1719,7 +1900,7 @@ impl Engine {
                         self.boot_counter.confirm(&pending.component)?;
                         continue;
                     }
-                    crate::robot::Health::Degraded(reason) => {
+                    Some(crate::robot::Health::Degraded(reason)) => {
                         tracing::warn!(
                             component = %pending.component,
                             version = %pending.version,
@@ -1816,27 +1997,22 @@ impl Engine {
 
             rec.finish(&Ok(outcome.clone()));
 
-            let logged = LogEntry {
-                at: now_unix(),
-                component: ComponentId::new(pending.component.clone()),
-                from: Some(pending.version.clone()),
-                to: match &outcome {
-                    ApplyResult::RolledBack { reverted_to, .. } => reverted_to.clone(),
-                    _ => None,
-                },
-                outcome: match &outcome {
-                    ApplyResult::Stuck { reason, .. } => Outcome::Aborted {
-                        reason: reason.clone(),
-                    },
-                    _ => Outcome::RolledBack {
-                        reason: reason.clone(),
-                    },
-                },
-                run: rec.run(),
-            };
-            if let Err(e) = self.journal.append(&logged) {
-                tracing::error!(error = %e, "could not write the update log");
-            }
+            // Through `record`, like every other outcome: the hand-built entry this replaces
+            // put the *reverted-to* version in `to` for a `RolledBack`, which `known_bad`
+            // reads as "the version that failed" — it blacklisted the release now running
+            // and never the one that actually failed. See `journal_outcome`.
+            //
+            // `from` is the release the board came from *before* the attempt, not the one
+            // that failed — that is `to`'s job, and `pending.previous` is what `apply` would
+            // have passed had the reboot not cut it short. Passing the failed version for
+            // both made `update log` render `1.1.0 → 1.1.0`, which reads as though nothing
+            // moved.
+            self.record(
+                &pending.component,
+                pending.previous.clone(),
+                &Ok(outcome.clone()),
+                rec.run(),
+            );
 
             outcomes.push(outcome);
         }
@@ -1944,8 +2120,17 @@ impl Engine {
                 let entry = crate::proto::LogEntry {
                     at: crate::journal::now_unix(),
                     component: crate::proto::ComponentId(name.clone()),
-                    from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
-                    to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
+                    // No `from`: the crumb knows the release the rescue moved off of and the
+                    // golden it landed on, and neither is what `from` means — the release the
+                    // board was on *before* the failed one was installed is not recorded
+                    // anywhere the rescue can reach. Naming the failed version here as well
+                    // rendered `1.1.0 → 1.1.0` in `update log`.
+                    from: None,
+                    // A `RolledBack` entry's `to` names the version that *failed* — the one
+                    // the rescue moved off of — never the golden it landed on. `known_bad`
+                    // reads this field; naming golden here would blacklist the release the
+                    // board is successfully running. See `Engine::record`.
+                    to: crumb.from.as_deref().and_then(|v| v.parse().ok()),
                     outcome: crate::proto::Outcome::RolledBack { reason: because },
                     run: rec.run(),
                 };
@@ -2088,6 +2273,33 @@ impl Engine {
         }
     }
 
+    /// The robot's verdict, asked for as long as `timeout` allows rather than once.
+    ///
+    /// Because `robotd` says so. Between its socket opening and its first tick it answers
+    /// "control loop has not completed a cycle yet", and the comment on that line reads:
+    /// `"Starting" is not "started". The gate polls, so it will see the transition.` Anything that
+    /// decides on this answer has to be that gate, or a robot that is merely late is a robot that
+    /// failed. Boot recovery asked once and reverted on what it heard.
+    ///
+    /// The first answer that settles the question, the last one heard when the time runs out, or
+    /// `None` when there was no time to ask at all.
+    async fn robot_verdict(&self, timeout: Duration) -> Option<crate::robot::Health> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last = None;
+        while tokio::time::Instant::now() < deadline {
+            let verdict = self.robot.health(ROBOT_QUERY_TIMEOUT).await;
+            if matches!(
+                verdict,
+                crate::robot::Health::Healthy | crate::robot::Health::Degraded(_)
+            ) {
+                return Some(verdict);
+            }
+            last = Some(verdict);
+            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+        last
+    }
+
     /// Wait for the new release to report healthy.
     ///
     /// A timeout is a **failure**: unproven is not healthy, or auto-rollback would
@@ -2115,38 +2327,30 @@ impl Engine {
             HealthCheck::Socket { .. } => {
                 // The socket path lives in `Config::robot_socket` and is used to build
                 // the RobotClient in `main`; here we just ask the client.
-                let deadline = tokio::time::Instant::now() + timeout;
-                let mut last = String::from("no answer");
-                while tokio::time::Instant::now() < deadline {
-                    match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                        crate::robot::Health::Healthy => return Ok(GatePassed::Healthy),
-                        // Passes. Logged at warn, not swallowed: committing a release onto a
-                        // robot that cannot move is the right call, but nobody should have to
-                        // guess afterwards that that is what happened.
-                        crate::robot::Health::Degraded(reason) => {
-                            tracing::warn!(
-                                reason = %reason,
-                                "committing: the robot is degraded for a reason this release \
-                                 cannot have caused and a rollback cannot fix"
-                            );
-                            return Ok(GatePassed::Degraded(reason));
-                        }
-                        crate::robot::Health::Unhealthy(reason) => last = reason,
-                        // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
-                        // about a robot that is serving its socket sends the reader to the wrong
-                        // half of the system for an hour; see `docs/project/install-path-gap.md`.
-                        crate::robot::Health::Incompatible(reason) => {
-                            last = format!(
-                                "answered in a shape this updaterd cannot read ({reason}) — \
-                                 the robot may be fine and the contract is what disagrees"
-                            );
-                        }
-                        crate::robot::Health::Unreachable => {
-                            last = "unreachable".into();
-                        }
+                let last = match self.robot_verdict(timeout).await {
+                    Some(crate::robot::Health::Healthy) => return Ok(GatePassed::Healthy),
+                    // Passes. Logged at warn, not swallowed: committing a release onto a
+                    // robot that cannot move is the right call, but nobody should have to
+                    // guess afterwards that that is what happened.
+                    Some(crate::robot::Health::Degraded(reason)) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "committing: the robot is degraded for a reason this release \
+                             cannot have caused and a rollback cannot fix"
+                        );
+                        return Ok(GatePassed::Degraded(reason));
                     }
-                    tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
-                }
+                    Some(crate::robot::Health::Unhealthy(reason)) => reason,
+                    // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
+                    // about a robot that is serving its socket sends the reader to the wrong
+                    // half of the system for an hour; see `docs/project/install-path-gap.md`.
+                    Some(crate::robot::Health::Incompatible(reason)) => format!(
+                        "answered in a shape this updaterd cannot read ({reason}) — \
+                         the robot may be fine and the contract is what disagrees"
+                    ),
+                    Some(crate::robot::Health::Unreachable) => "unreachable".into(),
+                    None => "no answer".into(),
+                };
                 Err(Error::Health(format!(
                     "not healthy within {}s: {last}",
                     timeout.as_secs()
@@ -2370,6 +2574,9 @@ const SYSTEMCTL: &str = "systemctl";
 
 /// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
 const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// The daemon that loads the duck detector, restarted by [`Engine::install_detector`].
+const MEDIAD_UNIT: &str = "mediad";
 
 /// This process's own unit, which the reconciliation must recognise and never restart.
 ///
